@@ -403,7 +403,7 @@ loop:
 			case playerCmdClose:
 				break loop
 			default:
-				panic("unknown player command")
+				p.log.Warnf("unknown player command type: %d", cmd.typ)
 			}
 		case err := <-outErr:
 			if err != nil {

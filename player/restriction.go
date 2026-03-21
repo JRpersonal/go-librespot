@@ -32,7 +32,8 @@ func isMediaRestricted(media *librespot.Media, country string) bool {
 		case *metadatapb.Restriction_CountriesForbidden:
 			return contains(ress.CountriesForbidden)
 		default:
-			panic("unexpected country restriction")
+			// Unknown restriction type — assume not restricted
+			return false
 		}
 	}
 
