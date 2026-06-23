@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -338,6 +339,13 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 
 	var apiCh chan ApiRequest
 
+	// playerMu guards currentPlayer and apiCh, which the API-forwarder goroutine
+	// reads while the logout handler and the zeroconf new-user callback replace
+	// and close them. Without it those accesses raced, and a send on a just-closed
+	// apiCh crashed the daemon ("send on closed channel") when a Connect session
+	// was transferred or taken over to another device.
+	var playerMu sync.Mutex
+
 	currentPlayer, err := appPlayerFunc(ctx)
 	if err != nil {
 		return err
@@ -357,7 +365,11 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 		for {
 			select {
 			case req := <-app.server.Receive():
-				if currentPlayer == nil {
+				playerMu.Lock()
+				cp, ch := currentPlayer, apiCh
+				playerMu.Unlock()
+
+				if cp == nil {
 					if req.Type == ApiRequestTypeRoot {
 						req.Reply(&ApiResponseRoot{}, nil)
 					} else {
@@ -366,7 +378,19 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 					break
 				}
 
-				apiCh <- req
+				// The session can be torn down (logout, takeover, new zeroconf
+				// user) between the read above and this send, which closes ch.
+				// A send on a closed channel panics ("send on closed channel")
+				// and previously crashed the daemon on a Connect transfer;
+				// recover and treat it as no session, like cp == nil above.
+				func() {
+					defer func() {
+						if recover() != nil {
+							req.Reply(nil, ErrNoSession)
+						}
+					}()
+					ch <- req
+				}()
 			}
 		}
 	}()
@@ -375,15 +399,19 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 		for {
 			select {
 			case <-ctx.Done():
+				playerMu.Lock()
 				if currentPlayer != nil {
 					currentPlayer.Close()
 					currentPlayer = nil
 
 					close(apiCh)
 				}
+				playerMu.Unlock()
 				return
 			case p := <-app.logoutCh:
+				playerMu.Lock()
 				if p != currentPlayer {
+					playerMu.Unlock()
 					continue
 				}
 
@@ -391,6 +419,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				currentPlayer = nil
 
 				close(apiCh)
+				playerMu.Unlock()
 
 				newAppPlayer, err := appPlayerFunc(ctx)
 				if err != nil {
@@ -400,14 +429,17 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				} else if newAppPlayer == nil {
 					app.zeroconf.SetCurrentUser("")
 				} else {
+					playerMu.Lock()
 					apiCh = make(chan ApiRequest)
 					currentPlayer = newAppPlayer
+					newCh := apiCh
+					playerMu.Unlock()
 
-					go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+					go newAppPlayer.Run(ctx, newCh, app.mpris.Receive())
 
 					app.zeroconf.SetCurrentUser(newAppPlayer.sess.Username())
 
-					app.log.WithField("username", librespot.ObfuscateUsername(currentPlayer.sess.Username())).
+					app.log.WithField("username", librespot.ObfuscateUsername(newAppPlayer.sess.Username())).
 						Debugf("restored session after logout")
 				}
 			}
@@ -415,12 +447,14 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 	}()
 
 	return app.zeroconf.Serve(func(req zeroconf.NewUserRequest) bool {
+		playerMu.Lock()
 		if currentPlayer != nil {
 			currentPlayer.Close()
 			currentPlayer = nil
 
 			close(apiCh)
 		}
+		playerMu.Unlock()
 
 		newAppPlayer, err := app.newAppPlayer(ctx, session.BlobCredentials{
 			Username: req.Username,
@@ -432,8 +466,11 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 			return false
 		}
 
+		playerMu.Lock()
 		apiCh = make(chan ApiRequest)
 		currentPlayer = newAppPlayer
+		newCh := apiCh
+		playerMu.Unlock()
 
 		if app.cfg.Credentials.Zeroconf.PersistCredentials {
 			app.state.Credentials.Username = newAppPlayer.sess.Username()
@@ -447,7 +484,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				Debugf("persisted zeroconf credentials")
 		}
 
-		go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+		go newAppPlayer.Run(ctx, newCh, app.mpris.Receive())
 		return true
 	})
 }
