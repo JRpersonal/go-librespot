@@ -267,7 +267,12 @@ func (out *pipeOutput) SetVolume(vol float32) {
 		panic(fmt.Sprintf("invalid volume value: %0.2f", vol))
 	}
 
+	// outputLoop reads out.volume while holding the lock; an unguarded write
+	// here is a data race with playback.
+	out.lock.Lock()
 	out.volume = vol
+	out.lock.Unlock()
+
 	sendVolumeUpdate(out.volumeUpdate, vol)
 }
 

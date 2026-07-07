@@ -834,13 +834,23 @@ func (p *AppPlayer) updateVolume(newVal uint32) {
 		p.app.log.WithError(err).Error("failed writing state after volume change")
 	}
 
-	// If there is a value in the channel buffer, remove it.
-	select {
-	case <-p.volumeUpdate:
-	default:
+	// Non-blocking delivery, last writer wins: the output driver (via the
+	// player command loop) pushes into the same one-slot buffer, and the old
+	// drain-then-blocking-send could wedge this loop forever when both sides
+	// raced for the slot (this method runs on the very goroutine that drains
+	// the channel — blocking here deadlocks volume handling).
+	newUpdate := float32(newVal) / player.MaxStateVolume
+	for {
+		select {
+		case p.volumeUpdate <- newUpdate:
+			return
+		default:
+		}
+		select {
+		case <-p.volumeUpdate:
+		default:
+		}
 	}
-
-	p.volumeUpdate <- float32(newVal) / player.MaxStateVolume
 }
 
 // Send notification that the volume changed.

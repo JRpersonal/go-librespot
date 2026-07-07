@@ -154,23 +154,31 @@ func NewOutput(options *NewOutputOptions) (Output, error) {
 	}
 }
 
-// Do a non-blocking send on the channel to send a volume update.
-// The channel must be a buffered channel, and this function must not be run
-// concurrently. If so, it will do a non-blocking send removing old values from
-// the start of the queue.
+// Do a non-blocking send on the channel to send a volume update, dropping
+// the stale value if the buffer is full.
+//
+// The channel must be a buffered channel. Unlike the old drain-then-send
+// (which assumed a single caller and could block forever when the daemon's
+// updateVolume raced an output driver for the same one-slot buffer), this
+// loop never blocks: each pass either delivers the value or frees a slot,
+// so concurrent callers converge with the last writer winning — exactly the
+// semantics volume wants.
 func sendVolumeUpdate(ch chan float32, val float32) {
 	if cap(ch) == 0 {
 		panic("channel must be buffered") // sanity check
 	}
 
-	// If there is a value in the channel buffer, remove it.
-	select {
-	case <-ch:
-	default:
-	}
+	for {
+		select {
+		case ch <- val:
+			return
+		default:
+		}
 
-	// Send the new value.
-	// This should be non-blocking, assuming there's only a single call to
-	// sendVolumeUpdate at a time.
-	ch <- val
+		// Buffer full: drop the stale value and retry.
+		select {
+		case <-ch:
+		default:
+		}
+	}
 }

@@ -34,8 +34,9 @@ type AppPlayer struct {
 	app  *App
 	sess *session.Session
 
-	stop   chan struct{}
-	logout chan *AppPlayer
+	stop      chan struct{}
+	closeOnce sync.Once
+	logout    chan *AppPlayer
 
 	player            *player.Player
 	initialVolumeOnce sync.Once
@@ -712,10 +713,16 @@ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2
 	return nil
 }
 
+// Close is idempotent: it can be reached twice during transfer storms (the
+// dealer-connect failure path inside Run closes itself, then the app-level
+// player switch closes again). A second pass through the old body would
+// wedge on the full stop buffer or race player.Close — sync.Once ends that.
 func (p *AppPlayer) Close() {
-	p.stop <- struct{}{}
-	p.player.Close()
-	p.sess.Close()
+	p.closeOnce.Do(func() {
+		p.stop <- struct{}{}
+		p.player.Close()
+		p.sess.Close()
+	})
 }
 
 func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
