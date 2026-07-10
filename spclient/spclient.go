@@ -75,11 +75,11 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.ContentLength = int64(len(body))
 
 		req.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil
 		}
-		req.Body, _ = req.GetBody()
 	}
 
 	var forceNewToken bool
@@ -92,6 +92,18 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 		}
 
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+
+		// The body must be re-armed on every attempt: http.Client.Do consumes
+		// req.Body, so a retried request (401 token refresh, 502, network
+		// error) would otherwise be sent with an empty body and the server
+		// would reject it with "400 Missing payload" (or worse, accept a
+		// state-corrupting empty payload).
+		if req.GetBody != nil {
+			req.Body, err = req.GetBody()
+			if err != nil {
+				return nil, backoff.Permanent(fmt.Errorf("failed re-creating request body: %w", err))
+			}
+		}
 
 		resp, err := c.client.Do(req.WithContext(ctx))
 		if err != nil {
@@ -109,12 +121,31 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 		}
 
 		return resp, nil
-	}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+	}, backoff.WithContext(newRequestBackOff(ctx), ctx))
 	if err != nil {
 		return nil, fmt.Errorf("spclient request failed: %w", err)
 	}
 
 	return resp, nil
+}
+
+// requestMaxElapsedTime bounds the total retry budget of a single spclient
+// request. The library default (15 minutes) could block a caller, and with it
+// the daemon's single event loop, for far too long.
+const requestMaxElapsedTime = 30 * time.Second
+
+// newRequestBackOff builds the retry policy for innerRequest: exponential,
+// bounded by requestMaxElapsedTime, and never exceeding the context deadline
+// when the caller brought one.
+func newRequestBackOff(ctx context.Context) *backoff.ExponentialBackOff {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = requestMaxElapsedTime
+	if deadline, ok := ctx.Deadline(); ok {
+		if remain := time.Until(deadline); remain > 0 && remain < bo.MaxElapsedTime {
+			bo.MaxElapsedTime = remain
+		}
+	}
+	return bo
 }
 
 func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
@@ -199,7 +230,7 @@ func (c *Spclient) PutConnectState(ctx context.Context, spotConnId string, reqPr
 				return nil, backoff.Permanent(&RateLimitedError{RetryAfter: parseRetryAfter(resp.Header), err: reqErr})
 			}
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				return nil, backoff.Permanent(reqErr)
+				return nil, backoff.Permanent(&PutStateRejectedError{err: reqErr})
 			}
 			return nil, reqErr
 		} else {
@@ -221,6 +252,16 @@ type RateLimitedError struct {
 
 func (e *RateLimitedError) Error() string { return e.err.Error() }
 func (e *RateLimitedError) Unwrap() error { return e.err }
+
+// PutStateRejectedError reports a connect-state PUT the server rejected with a
+// non-retryable 4xx (other than 429): resending the same payload cannot
+// succeed, the next state transition sends a fresh one anyway.
+type PutStateRejectedError struct {
+	err error
+}
+
+func (e *PutStateRejectedError) Error() string { return e.err.Error() }
+func (e *PutStateRejectedError) Unwrap() error { return e.err }
 
 // parseRetryAfter reads a Retry-After header (seconds or HTTP-date), with a default fallback.
 func parseRetryAfter(h http.Header) time.Duration {
