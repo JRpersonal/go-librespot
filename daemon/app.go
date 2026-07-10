@@ -240,6 +240,8 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		NormalisationUseAlbumGain: app.cfg.NormalisationUseAlbumGain,
 		NormalisationPregain:      app.cfg.NormalisationPregain,
 
+		CrossfadeDuration: time.Duration(app.cfg.CrossfadeDuration) * time.Millisecond,
+
 		CountryCode: appPlayer.countryCode,
 
 		AudioBackend:              app.cfg.AudioBackend,
@@ -370,9 +372,16 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				playerMu.Unlock()
 
 				if cp == nil {
-					if req.Type == ApiRequestTypeRoot {
+					switch req.Type {
+					case ApiRequestTypeRoot:
 						req.Reply(&ApiResponseRoot{}, nil)
-					} else {
+					case ApiRequestSetDeviceName:
+						// The device name drives the zeroconf advertisement, which
+						// runs independently of any player session, so handle it
+						// even when no session is active.
+						app.SetDeviceName(req.Data.(string))
+						req.Reply(nil, nil)
+					default:
 						req.Reply(nil, ErrNoSession)
 					}
 					break
