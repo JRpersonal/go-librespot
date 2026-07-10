@@ -760,7 +760,13 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 
 	// Seek to the correct position if needed.
 	if mediaPosition > 0 {
-		if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
+		if p.passthrough {
+			// A passthrough stream cannot seek (a mid-page byte seek would
+			// corrupt the Ogg bitstream). Start from the beginning instead of
+			// failing the whole stream load, e.g. on a Connect transfer that
+			// carries a mid-track position.
+			log.Warnf("passthrough stream cannot seek to %dms, starting from the beginning", mediaPosition)
+		} else if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
 			return nil, fmt.Errorf("failed seeking stream: %w", err)
 		}
 	}
