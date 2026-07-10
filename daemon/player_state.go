@@ -174,7 +174,17 @@ func (p *AppPlayer) updateState(ctx context.Context) {
 	p.flushState(ctx)
 }
 
+// statePutTimeout bounds a single connect-state PUT (including its internal
+// retries). The PUT runs on the AppPlayer's single Run goroutine and callers
+// pass the app-lifetime context, so without its own deadline a wedged network
+// or a misbehaving endpoint would block the entire event loop for minutes
+// (dealer requests, API requests and player events all stall behind it).
+const statePutTimeout = 10 * time.Second
+
 func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutStateReason) error {
+	ctx, cancel := context.WithTimeout(ctx, statePutTimeout)
+	defer cancel()
+
 	if reason == connectpb.PutStateReason_BECAME_INACTIVE {
 		return p.sess.Spclient().PutConnectStateInactive(ctx, p.spotConnId, false)
 	}

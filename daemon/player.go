@@ -45,6 +45,7 @@ type AppPlayer struct {
 	stateDirty        bool
 	statePutScheduled bool
 	lastStatePut      time.Time
+	stateRetryBackoff time.Duration
 
 	spotConnId string
 
@@ -721,12 +722,17 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 	p.stateTimer = time.NewTimer(time.Minute)
 	p.stateTimer.Stop() // armed on demand by updateState
 
+	// A closed receiver channel must be set to nil (a nil channel blocks
+	// forever in a select) instead of being re-selected with `continue`:
+	// a closed channel is always ready, so `continue` would spin this loop
+	// at 100% CPU until shutdown.
 	for {
 		select {
 		case <-p.stop:
 			return
 		case pkt, ok := <-apRecv:
 			if !ok {
+				apRecv = nil
 				continue
 			}
 
@@ -735,6 +741,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case msg, ok := <-msgRecv:
 			if !ok {
+				msgRecv = nil
 				continue
 			}
 
@@ -743,6 +750,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case req, ok := <-reqRecv:
 			if !ok {
+				reqRecv = nil
 				continue
 			}
 
@@ -755,6 +763,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case req, ok := <-apiRecv:
 			if !ok {
+				apiRecv = nil
 				continue
 			}
 
@@ -762,6 +771,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			req.Reply(data, err)
 		case mprisReq, ok := <-mprisRecv:
 			if !ok {
+				mprisRecv = nil
 				continue
 			}
 
@@ -778,6 +788,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			mprisReq.Reply(dbusError)
 		case ev, ok := <-playerRecv:
 			if !ok {
+				playerRecv = nil
 				continue
 			}
 
@@ -805,20 +816,50 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 	}
 }
 
-// flushState PUTs the latest connect-state and records the send time. On a rate-limit it
-// schedules a coalesced resend after the cooldown. Runs on the Run goroutine.
+// stateRetryBackoff bounds for resending a failed connect-state PUT.
+const (
+	stateRetryBackoffInitial = 2 * time.Second
+	stateRetryBackoffMax     = time.Minute
+)
+
+// flushState PUTs the latest connect-state and records the send time. On failure the state
+// stays dirty and the coalescing timer is re-armed (Retry-After on a rate-limit, growing
+// backoff on transient errors) so the latest state converges instead of being lost — a
+// dropped PUT would leave Spotify showing a stale device state until the next transition.
+// Runs on the Run goroutine.
 func (p *AppPlayer) flushState(ctx context.Context) {
 	p.stateDirty = false
 	p.lastStatePut = time.Now()
 	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
 		p.app.log.WithError(err).Error("failed put state after update")
 
-		// Rate-limited: resend the latest state after the cooldown instead of dropping it.
 		var rl *spclient.RateLimitedError
-		if errors.As(err, &rl) {
+		var rejected *spclient.PutStateRejectedError
+		switch {
+		case errors.As(err, &rl):
+			// Rate-limited: resend the latest state after the advised cooldown.
+			p.stateRetryBackoff = 0
 			p.stateDirty = true
 			p.statePutScheduled = true
 			p.stateTimer.Reset(rl.RetryAfter)
+		case errors.As(err, &rejected):
+			// Non-retryable rejection: the same payload cannot succeed and the
+			// next state transition sends a fresh one anyway.
+			p.stateRetryBackoff = 0
+		default:
+			// Transient failure (timeout, 5xx, network): keep the state dirty and
+			// re-arm the coalescing timer with growing backoff.
+			if p.stateRetryBackoff <= 0 {
+				p.stateRetryBackoff = stateRetryBackoffInitial
+			} else {
+				p.stateRetryBackoff = min(2*p.stateRetryBackoff, stateRetryBackoffMax)
+			}
+			p.stateDirty = true
+			p.statePutScheduled = true
+			p.stateTimer.Reset(p.stateRetryBackoff)
 		}
+		return
 	}
+
+	p.stateRetryBackoff = 0
 }
