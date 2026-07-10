@@ -701,6 +701,20 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
 		}
 
 		p.state.player.Track = p.state.tracks.CurrentTrack()
+		if p.state.player.Track == nil {
+			// The context has no established position, e.g. because its pages
+			// could not be fetched (a radio-router 404 here used to panic with
+			// "invalid paged list position: -1"). There is nothing to load or
+			// skip to: stop playback cleanly instead.
+			p.app.log.Warnf("no current track in context %s, stopping playback", p.state.player.ContextUri)
+			p.state.player.Timestamp = time.Now().UnixMilli()
+			p.state.player.PositionAsOfTimestamp = 0
+			p.state.player.IsPlaying = false
+			p.state.player.IsPaused = false
+			p.state.player.IsBuffering = false
+			return false, nil
+		}
+
 		p.state.player.PrevTracks = p.state.tracks.PrevTracks()
 		p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
 		p.state.player.Index = p.state.tracks.Index()

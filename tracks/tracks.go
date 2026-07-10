@@ -167,7 +167,7 @@ func (tl *List) NextTracks(ctx context.Context, nextHint []*connectpb.ContextTra
 }
 
 func (tl *List) Index() *connectpb.ContextIndex {
-	if tl.playingQueue {
+	if tl.playingQueue || !tl.tracks.hasCurrent() {
 		return &connectpb.ContextIndex{}
 	}
 
@@ -180,12 +180,23 @@ func (tl *List) current() *connectpb.ContextTrack {
 		return tl.queue[0]
 	}
 
+	// The list may have no established position when its pages could never
+	// be fetched (e.g. a radio-router 404): there is no current track then.
+	if !tl.tracks.hasCurrent() {
+		return nil
+	}
+
 	curr := tl.tracks.get()
 	return curr.item
 }
 
+// CurrentTrack returns the current track, or nil when the list has no
+// established position (see current).
 func (tl *List) CurrentTrack() *connectpb.ProvidedTrack {
 	item := tl.current()
+	if item == nil {
+		return nil
+	}
 	return librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), item)
 }
 
