@@ -23,11 +23,9 @@ type pagedListInterator[T any] struct {
 }
 
 func (i *pagedListInterator[T]) prev() bool {
-	if i.pos < 0 {
-		panic(fmt.Sprintf("invalid paged list iterator position: %d", i.pos))
-	}
-
-	if i.pos == 0 {
+	// pos == -1 (before the start, e.g. an iterator over a list whose
+	// position was never established) simply has nothing before it.
+	if i.pos <= 0 {
 		i.err = nil
 		return false
 	}
@@ -78,10 +76,12 @@ func newPagedList[T any](log librespot.Logger, pages librespot.PageResolver[T]) 
 }
 
 func (l *pagedList[T]) iterHere() *pagedListInterator[T] {
-	if l.pos < 0 {
-		panic(fmt.Sprintf("invalid paged list position: %d", l.pos))
-	}
-
+	// A list whose position was never established has pos == -1: for example
+	// when resolving the context pages failed (a radio-router 404 while
+	// advancing to the next track used to panic here). Hand out an iterator
+	// positioned before the start instead: next() (re)fetches the first page
+	// and prev() reports nothing before it, so callers see an empty or ended
+	// context rather than a crash.
 	return &pagedListInterator[T]{list: l, pos: l.pos, err: nil}
 }
 
@@ -117,6 +117,12 @@ func (l *pagedList[T]) get() pagedListItem[T] {
 	}
 
 	return l.list[l.pos]
+}
+
+// hasCurrent reports whether the list has an established, in-bounds position,
+// i.e. whether get() would succeed.
+func (l *pagedList[T]) hasCurrent() bool {
+	return l.pos >= 0 && l.pos < len(l.list)
 }
 
 func (l *pagedList[T]) swap(i, j int) {

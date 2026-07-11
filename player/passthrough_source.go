@@ -1,6 +1,7 @@
 package player
 
 import (
+	"errors"
 	"io"
 	"sync"
 )
@@ -61,7 +62,12 @@ func (p *passthroughSource) SetPositionMs(posMs int64) error {
 		p.pos = 0
 		return err
 	}
-	return nil
+	// Report the seek as failed instead of pretending it happened: returning
+	// nil here made the daemon acknowledge a position jump the audio never
+	// performed, so the reported position stayed wrong until the next track.
+	// With a real error the controller (e.g. the Spotify app) snaps back to
+	// the actual position.
+	return errors.New("passthrough source cannot seek mid-stream")
 }
 
 func (p *passthroughSource) Close() error { return nil }

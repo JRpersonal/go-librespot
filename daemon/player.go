@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -25,6 +26,7 @@ import (
 	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	"github.com/devgianlu/go-librespot/session"
+	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/devgianlu/go-librespot/tracks"
 )
 
@@ -38,6 +40,12 @@ type AppPlayer struct {
 	player            *player.Player
 	initialVolumeOnce sync.Once
 	volumeUpdate      chan float32
+
+	stateTimer        *time.Timer
+	stateDirty        bool
+	statePutScheduled bool
+	lastStatePut      time.Time
+	stateRetryBackoff time.Duration
 
 	spotConnId string
 
@@ -55,6 +63,12 @@ type AppPlayer struct {
 	secondaryStream *player.Stream
 
 	prefetchTimer *time.Timer
+
+	// consecutiveUnplayableSkips bounds how many unplayable tracks in a row advanceNext will
+	// skip past (Spotify-refused audio keys / restricted media) before giving up — so a run
+	// of refused tracks (even at the very start of a context) advances to the first playable
+	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
+	consecutiveUnplayableSkips int
 }
 
 func (p *AppPlayer) playbackReady() bool {
@@ -271,8 +285,9 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
 		p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
 		p.state.player.Index = ctxTracks.Index()
 
-		// load current track into stream
-		if err := p.loadCurrentTrack(ctx, pause, true); err != nil {
+		// load current track into stream — skip forward if the transferred track is unplayable
+		// (Spotify refused its key / restricted), so a cast onto a refused track doesn't freeze.
+		if err := p.loadCurrentTrackOrSkip(ctx, pause, true); err != nil {
 			return fmt.Errorf("failed loading current track (transfer): %w", err)
 		}
 
@@ -704,12 +719,20 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 	volumeTimer := time.NewTimer(time.Minute)
 	volumeTimer.Stop() // don't emit a volume change event at start
 
+	p.stateTimer = time.NewTimer(time.Minute)
+	p.stateTimer.Stop() // armed on demand by updateState
+
+	// A closed receiver channel must be set to nil (a nil channel blocks
+	// forever in a select) instead of being re-selected with `continue`:
+	// a closed channel is always ready, so `continue` would spin this loop
+	// at 100% CPU until shutdown.
 	for {
 		select {
 		case <-p.stop:
 			return
 		case pkt, ok := <-apRecv:
 			if !ok {
+				apRecv = nil
 				continue
 			}
 
@@ -718,6 +741,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case msg, ok := <-msgRecv:
 			if !ok {
+				msgRecv = nil
 				continue
 			}
 
@@ -726,6 +750,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case req, ok := <-reqRecv:
 			if !ok {
+				reqRecv = nil
 				continue
 			}
 
@@ -738,6 +763,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case req, ok := <-apiRecv:
 			if !ok {
+				apiRecv = nil
 				continue
 			}
 
@@ -745,6 +771,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			req.Reply(data, err)
 		case mprisReq, ok := <-mprisRecv:
 			if !ok {
+				mprisRecv = nil
 				continue
 			}
 
@@ -761,6 +788,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			mprisReq.Reply(dbusError)
 		case ev, ok := <-playerRecv:
 			if !ok {
+				playerRecv = nil
 				continue
 			}
 
@@ -778,6 +806,60 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 		case <-volumeTimer.C:
 			// We've gone some time without update, send the new value now.
 			p.volumeUpdated(ctx)
+		case <-p.stateTimer.C:
+			p.statePutScheduled = false
+			if !p.stateDirty {
+				break
+			}
+			p.flushState(ctx)
 		}
 	}
+}
+
+// stateRetryBackoff bounds for resending a failed connect-state PUT.
+const (
+	stateRetryBackoffInitial = 2 * time.Second
+	stateRetryBackoffMax     = time.Minute
+)
+
+// flushState PUTs the latest connect-state and records the send time. On failure the state
+// stays dirty and the coalescing timer is re-armed (Retry-After on a rate-limit, growing
+// backoff on transient errors) so the latest state converges instead of being lost — a
+// dropped PUT would leave Spotify showing a stale device state until the next transition.
+// Runs on the Run goroutine.
+func (p *AppPlayer) flushState(ctx context.Context) {
+	p.stateDirty = false
+	p.lastStatePut = time.Now()
+	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
+		p.app.log.WithError(err).Error("failed put state after update")
+
+		var rl *spclient.RateLimitedError
+		var rejected *spclient.PutStateRejectedError
+		switch {
+		case errors.As(err, &rl):
+			// Rate-limited: resend the latest state after the advised cooldown.
+			p.stateRetryBackoff = 0
+			p.stateDirty = true
+			p.statePutScheduled = true
+			p.stateTimer.Reset(rl.RetryAfter)
+		case errors.As(err, &rejected):
+			// Non-retryable rejection: the same payload cannot succeed and the
+			// next state transition sends a fresh one anyway.
+			p.stateRetryBackoff = 0
+		default:
+			// Transient failure (timeout, 5xx, network): keep the state dirty and
+			// re-arm the coalescing timer with growing backoff.
+			if p.stateRetryBackoff <= 0 {
+				p.stateRetryBackoff = stateRetryBackoffInitial
+			} else {
+				p.stateRetryBackoff = min(2*p.stateRetryBackoff, stateRetryBackoffMax)
+			}
+			p.stateDirty = true
+			p.statePutScheduled = true
+			p.stateTimer.Reset(p.stateRetryBackoff)
+		}
+		return
+	}
+
+	p.stateRetryBackoff = 0
 }

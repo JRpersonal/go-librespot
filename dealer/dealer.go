@@ -235,12 +235,30 @@ loop:
 	select {
 	case <-d.done:
 	default:
+		// Never give up reconnecting: the daemon has no way to revive a
+		// dealer that closed itself, so a permanent failure here (the
+		// default backoff gives up after ~15 minutes, e.g. during a long
+		// network or Spotify outage) silently killed Connect until the
+		// process was restarted. Retry forever with a capped interval and
+		// stop only when the dealer is closed for real.
+		bo := backoff.NewExponentialBackOff()
+		bo.MaxElapsedTime = 0
+		bo.MaxInterval = 2 * time.Minute
+
 		d.connMu.Lock()
-		if err := backoff.Retry(d.reconnect, backoff.NewExponentialBackOff()); err != nil {
+		err := backoff.Retry(func() error {
+			select {
+			case <-d.done:
+				return backoff.Permanent(ErrDealerClosed)
+			default:
+				return d.reconnect()
+			}
+		}, bo)
+		if err != nil {
 			d.log.WithError(err).Errorf("failed reconnecting dealer")
 			d.connMu.Unlock()
 
-			// something went very wrong, give up
+			// the dealer was closed while we were reconnecting
 			d.Close()
 		} else {
 			d.connMu.Unlock()
@@ -285,7 +303,13 @@ func (d *Dealer) sendReply(key string, success bool) error {
 }
 
 func (d *Dealer) reconnect() error {
-	if err := d.connect(context.TODO()); err != nil {
+	// A fresh bounded context: reconnect() runs from the recv loop long after
+	// the original Connect context is gone, and connect() must not be able to
+	// hang forever on a stalled dial or token fetch.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := d.connect(ctx); err != nil {
 		return err
 	}
 

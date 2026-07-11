@@ -328,9 +328,46 @@ func (suite *PagedListInternalSuite) TestGetPanics() {
 	suite.Panics(func() { suite.list.get() }, "should panic when getting from invalid position")
 }
 
-func (suite *PagedListInternalSuite) TestIterHerePanics() {
-	// Should panic when trying to create iterator from invalid position
-	suite.Panics(func() { suite.list.iterHere() }, "should panic when creating iterator from invalid position")
+func (suite *PagedListInternalSuite) TestIterHereUnpositioned() {
+	// A list without an established position (pos == -1, e.g. because the
+	// initial page fetch failed) must hand out a before-the-start iterator
+	// instead of panicking: prev() reports nothing before it and next()
+	// (re)fetches the first page.
+	suite.resolver.EXPECT().Page(mock.Anything, 0).Return([]int{10, 20}, nil).Once()
+
+	var iter *pagedListInterator[int]
+	suite.NotPanics(func() { iter = suite.list.iterHere() }, "iterHere must not panic on an unpositioned list")
+
+	suite.False(iter.prev(), "there is nothing before the start")
+	suite.NoError(iter.error())
+
+	suite.True(iter.next(context.Background()), "next should fetch the first page")
+	item := iter.get()
+	suite.Equal(10, item.item)
+}
+
+func (suite *PagedListInternalSuite) TestIterHereUnpositionedFetchError() {
+	// Unpositioned list whose pages keep failing (the upstream #324 case: a
+	// radio-router 404 while advancing to the next track): the iterator
+	// reports the error instead of crashing, and hasCurrent stays false.
+	suite.resolver.EXPECT().Page(mock.Anything, 0).Return(nil, assert.AnError).Once()
+
+	iter := suite.list.iterHere()
+	suite.False(iter.next(context.Background()))
+	suite.Error(iter.error())
+	suite.False(suite.list.hasCurrent())
+}
+
+func (suite *PagedListInternalSuite) TestHasCurrent() {
+	suite.resolver.EXPECT().Page(mock.Anything, 0).Return([]int{1, 2, 3}, nil).Once()
+
+	suite.False(suite.list.hasCurrent(), "empty list has no current item")
+
+	suite.NoError(suite.list.moveStart(context.Background()))
+	suite.True(suite.list.hasCurrent())
+
+	suite.list.clear()
+	suite.False(suite.list.hasCurrent(), "cleared list has no current item")
 }
 
 func (suite *PagedListInternalSuite) TestIterHere() {

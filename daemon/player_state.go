@@ -156,13 +156,35 @@ func (p *AppPlayer) initState() {
 	p.state.reset()
 }
 
+// statePutMinInterval is the minimum spacing between connect-state PUTs.
+const statePutMinInterval = 200 * time.Millisecond
+
+// updateState PUTs the latest connect-state, at most one per statePutMinInterval: immediately
+// and synchronously when the budget allows, else deferred to the timer so a burst coalesces.
 func (p *AppPlayer) updateState(ctx context.Context) {
-	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
-		p.app.log.WithError(err).Error("failed put state after update")
+	p.stateDirty = true
+	if p.statePutScheduled {
+		return
 	}
+	if wait := statePutMinInterval - time.Since(p.lastStatePut); wait > 0 {
+		p.statePutScheduled = true
+		p.stateTimer.Reset(wait)
+		return
+	}
+	p.flushState(ctx)
 }
 
+// statePutTimeout bounds a single connect-state PUT (including its internal
+// retries). The PUT runs on the AppPlayer's single Run goroutine and callers
+// pass the app-lifetime context, so without its own deadline a wedged network
+// or a misbehaving endpoint would block the entire event loop for minutes
+// (dealer requests, API requests and player events all stall behind it).
+const statePutTimeout = 10 * time.Second
+
 func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutStateReason) error {
+	ctx, cancel := context.WithTimeout(ctx, statePutTimeout)
+	defer cancel()
+
 	if reason == connectpb.PutStateReason_BECAME_INACTIVE {
 		return p.sess.Spclient().PutConnectStateInactive(ctx, p.spotConnId, false)
 	}
