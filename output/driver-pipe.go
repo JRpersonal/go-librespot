@@ -291,6 +291,14 @@ func (out *pipeOutput) Close() error {
 
 	_ = out.file.Close()
 
+	// Also close the source reader when it supports it, so a goroutine
+	// blocked in a network read terminates instead of leaking. In
+	// passthrough mode preader is the same underlying object as reader
+	// (it is a type assertion of it), so one close covers both paths.
+	if c, ok := out.reader.(io.Closer); ok {
+		_ = c.Close()
+	}
+
 	out.closed = true
 	out.cond.Signal()
 
