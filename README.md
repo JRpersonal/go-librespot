@@ -1,13 +1,37 @@
-# go-librespot
+<h1 align="center">go-librespot</h1>
 
-[![GitHub release](https://img.shields.io/github/release/devgianlu/go-librespot.svg)](https://github.com/devgianlu/go-librespot/releases/latest)
-![GitHub branch check runs](https://img.shields.io/github/check-runs/devgianlu/go-librespot/master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/devgianlu/go-librespot)](https://goreportcard.com/report/github.com/devgianlu/go-librespot)
-[![GitHub License](https://img.shields.io/github/license/devgianlu/go-librespot)](https://github.com/devgianlu/go-librespot/blob/master/LICENSE)
+<p align="center">
+  <em>Yet another open-source Spotify Connect compatible client, written in Go.</em>
+  <br>
+  go-librespot gives you the freedom to have a Spotify Connect device wherever you want.
+</p>
 
-Yet another open-source Spotify Connect compatible client, written in Go.
+<p align="center">
+  <a href="https://github.com/devgianlu/go-librespot/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/release/devgianlu/go-librespot.svg"></a>
+  <img alt="GitHub branch check runs" src="https://img.shields.io/github/check-runs/devgianlu/go-librespot/master">
+  <a href="https://github.com/devgianlu/go-librespot/blob/master/LICENSE"><img alt="GitHub License" src="https://img.shields.io/github/license/devgianlu/go-librespot"></a>
+</p>
 
-> go-librespot gives you the freedom to have a Spotify Connect device wherever you want.
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#getting-started">Getting Started</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#development">Development</a>
+</p>
+
+## Features
+
+- 🎵 **Spotify Connect** — show up as a speaker in the Spotify app and stream to it from any device on your network (Spotify Premium required).
+- 🔊 **Multiple audio backends** — ALSA, PulseAudio, or a raw named pipe for custom routing.
+- 📊 **Loudness normalization** — Spotify-standard −14 LUFS (ITU-R BS.1770) with configurable pregain.
+- 🔀 **Crossfade** — configurable overlap between consecutive tracks.
+- 🎚️ **Flexible volume control** — independent, synchronized with the ALSA mixer, or fully external.
+- 💾 **On-disk audio cache** — skip re-downloading tracks, bounded by an LRU size limit.
+- 🔐 **Multiple login flows** — Zeroconf discovery, interactive OAuth, or a Spotify access token.
+- 📡 **Selectable mDNS backend** — the built-in responder or the system Avahi daemon.
+- 🌐 **REST API + WebSocket events** — control and monitor playback programmatically.
+- 🖥️ **MPRIS integration** — control playback over D-Bus / standard Linux media keys.
+- 🪶 **Lightweight & portable** — a single Go binary, ideal for Raspberry Pi and other embedded devices.
 
 ## Getting Started
 
@@ -157,6 +181,20 @@ server:
 ```
 
 For detailed API documentation see [here](/API.md).
+
+### Audio cache
+
+Downloaded audio files can be cached on disk so that replaying a track does not download it again from the CDN. Only the
+raw, still-encrypted files are stored: a cached file is useless without a valid Spotify account, since the audio key is
+retrieved again on every playback. The cache is disabled by default; once enabled it applies a 1 GB limit, after which the
+least-recently-used files are evicted.
+
+```yaml
+cache:
+  enabled: false # Whether to cache downloaded audio files (default: false)
+  dir: '' # Directory for cached files (default: the XDG cache directory, e.g. $XDG_CACHE_HOME/go-librespot or $HOME/.cache/go-librespot)
+  size_limit: '1GB' # Maximum total cache size before evicting least-recently-used files ('0' for unlimited)
+```
 
 ### Volume synchronization
 

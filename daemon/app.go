@@ -13,6 +13,7 @@ import (
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/apresolve"
+	"github.com/devgianlu/go-librespot/cache"
 	"github.com/devgianlu/go-librespot/mpris"
 	"github.com/devgianlu/go-librespot/player"
 	"github.com/devgianlu/go-librespot/playplay"
@@ -41,6 +42,8 @@ type App struct {
 	server   ApiServer
 	mpris    mpris.Server
 	logoutCh chan *AppPlayer
+
+	audioCache *cache.Cache
 
 	closed bool
 }
@@ -126,6 +129,13 @@ func New(opts *Options) (*App, error) {
 		app.mpris = opts.MediaPlayer
 	} else {
 		app.mpris = mpris.DummyServer{}
+	}
+
+	if app.cfg.Cache.Enabled && app.cfg.Cache.Dir != "" {
+		app.audioCache, err = cache.New(app.log, app.cfg.Cache.Dir, app.cfg.Cache.SizeLimit)
+		if err != nil {
+			return nil, fmt.Errorf("failed initializing audio cache: %w", err)
+		}
 	}
 
 	return app, nil
@@ -233,6 +243,8 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		AudioKey: appPlayer.sess.AudioKey(),
 		Events:   appPlayer.sess.Events(),
 		Log:      app.log,
+
+		Cache: app.audioCache,
 
 		FlacEnabled: app.cfg.FlacEnabled,
 

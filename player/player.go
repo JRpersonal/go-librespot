@@ -11,6 +11,7 @@ import (
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/audio"
+	"github.com/devgianlu/go-librespot/cache"
 	"github.com/devgianlu/go-librespot/flac"
 	"github.com/devgianlu/go-librespot/output"
 	"github.com/devgianlu/go-librespot/playplay"
@@ -51,6 +52,8 @@ type Player struct {
 	sp       *spclient.Spclient
 	audioKey *audio.KeyProvider
 	events   EventManager
+
+	cache *cache.Cache
 
 	cdnQuarantine map[string]time.Time
 
@@ -96,6 +99,10 @@ type Options struct {
 	Events   EventManager
 
 	Log librespot.Logger
+
+	// Cache, when non-nil, is used to store and retrieve encrypted audio files
+	// on disk, avoiding a CDN download when a track is played again.
+	Cache *cache.Cache
 
 	// FlacEnabled specifies if FLAC files should be preferred when available.
 	// When setting this to true, it is assumed that the PlayPlay plugin is provided.
@@ -180,6 +187,7 @@ func NewPlayer(opts *Options) (*Player, error) {
 		sp:                        opts.Spclient,
 		audioKey:                  opts.AudioKey,
 		events:                    opts.Events,
+		cache:                     opts.Cache,
 		cdnQuarantine:             make(map[string]time.Time),
 		flacEnabled:               opts.FlacEnabled,
 		passthrough:               opts.AudioOutputPipePassthrough,
@@ -235,6 +243,9 @@ func (p *Player) manageLoop() {
 	// initial volume is 1
 	volume := float32(1)
 
+	// whether the output is paused, so seek knows whether to resume after Drop
+	paused := false
+
 	// init main source
 	source := NewSwitchingAudioSource(p.crossfadeSamples)
 
@@ -264,6 +275,13 @@ loop:
 					p.log.Debugf("created new output device")
 				}
 
+				// Flush the previous source before switching, otherwise the
+				// new track's opening is buffered then dropped, clipping it on
+				// pulseaudio (#292).
+				if data.drop {
+					_ = out.Drop()
+				}
+
 				// set source
 				source.SetPrimary(data.source)
 				if data.paused {
@@ -277,10 +295,7 @@ loop:
 						break
 					}
 				}
-
-				if data.drop {
-					_ = out.Drop()
-				}
+				paused = data.paused
 
 				p.startedPlaying = time.Now()
 				cmd.resp <- nil
@@ -295,10 +310,12 @@ loop:
 					if err := out.Resume(); err != nil {
 						cmd.resp <- err
 					} else {
+						paused = false
 						cmd.resp <- nil
 						p.ev <- Event{Type: EventTypeResume}
 					}
 				} else {
+					paused = false
 					cmd.resp <- nil
 				}
 			case playerCmdPause:
@@ -306,10 +323,12 @@ loop:
 					if err := out.Pause(); err != nil {
 						cmd.resp <- err
 					} else {
+						paused = true
 						cmd.resp <- nil
 						p.ev <- Event{Type: EventTypePause}
 					}
 				} else {
+					paused = true
 					cmd.resp <- nil
 				}
 			case playerCmdStop:
@@ -330,7 +349,11 @@ loop:
 					} else if err = out.Drop(); err != nil {
 						cmd.resp <- err
 					} else {
-						cmd.resp <- nil
+						// Drop no longer restarts the stream; resume unless paused.
+						if !paused {
+							err = out.Resume()
+						}
+						cmd.resp <- err
 					}
 				} else {
 					cmd.resp <- nil
@@ -685,19 +708,59 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 
 	p.events.PostStreamRequestAudioKey(playbackId)
 
-	storageResolve, err := p.sp.ResolveStorageInteractive(ctx, file.FileId, file.Format, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed resolving track storage: %w", err)
+	// Prefer a cached copy of the encrypted audio file when available: this
+	// avoids resolving storage and downloading from the CDN entirely. The audio
+	// key is still required to decrypt it below.
+	var rawStream librespot.SizedReadAtSeeker
+
+	// Close the raw stream if stream setup fails before it is handed off to a
+	// Stream (e.g. a cached file that fails to decode); this releases the open
+	// file handle or cancels the in-flight download.
+	streamHandedOff := false
+	defer func() {
+		if !streamHandedOff {
+			if closer, ok := rawStream.(io.Closer); ok && closer != nil {
+				_ = closer.Close()
+			}
+		}
+	}()
+
+	if p.cache != nil {
+		if cached, ok := p.cache.File(file.FileId); ok {
+			log.Debugf("using cached audio file (%d bytes)", cached.Size())
+			rawStream = cached
+		}
 	}
 
-	p.events.PostStreamResolveStorage(playbackId)
+	if rawStream == nil {
+		storageResolve, err := p.sp.ResolveStorageInteractive(ctx, file.FileId, file.Format, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving track storage: %w", err)
+		}
 
-	rawStream, err := p.httpChunkedReaderFromStorageResolve(log, client, storageResolve)
-	if err != nil {
-		return nil, fmt.Errorf("failed creating chunked reader: %w", err)
+		p.events.PostStreamResolveStorage(playbackId)
+
+		httpStream, err := p.httpChunkedReaderFromStorageResolve(log, client, storageResolve)
+		if err != nil {
+			return nil, fmt.Errorf("failed creating chunked reader: %w", err)
+		}
+
+		p.events.PostStreamInitHttpChunkReader(playbackId, httpStream)
+
+		// Persist the encrypted file to the cache once it has been fully
+		// downloaded. This is best-effort: caching failures never affect
+		// playback.
+		if p.cache != nil {
+			fileId := file.FileId
+			httpStream.OnComplete(func(r io.ReaderAt, size int64) {
+				if err := p.cache.SaveFile(fileId, io.NewSectionReader(r, 0, size)); err != nil {
+					log.WithError(err).Warnf("failed caching audio file")
+				}
+			})
+		}
+
+		rawStream = httpStream
 	}
-
-	p.events.PostStreamInitHttpChunkReader(playbackId, rawStream)
 
 	decryptedStream, err := audio.NewAesAudioDecryptor(rawStream, audioKey)
 	if err != nil {
@@ -771,5 +834,6 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 	}
 
+	streamHandedOff = true
 	return &Stream{PlaybackId: playbackId, RequestedId: requestedId, Source: stream, Media: media, File: file}, nil
 }
