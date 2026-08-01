@@ -64,15 +64,16 @@ func (o *recordingOutput) snapshot() []string {
 
 // newTestPlayer builds a Player driven by manageLoop with newOutput wired to
 // the given recordingOutput, bypassing NewPlayer (which requires a real
-// spclient/session) since manageLoop only touches p.log, p.cmd, p.ev,
+// spclient/session) since manageLoop only touches p.log, p.cmd, p.ev, p.done,
 // p.crossfadeSamples and p.newOutput.
 func newTestPlayer(t *testing.T, out *recordingOutput) *Player {
 	t.Helper()
 
 	p := &Player{
-		log: &librespot.NullLogger{},
-		cmd: make(chan playerCmd),
-		ev:  make(chan Event, 128),
+		log:  &librespot.NullLogger{},
+		cmd:  make(chan playerCmd),
+		ev:   make(chan Event, 128),
+		done: make(chan struct{}),
 		newOutput: func(reader librespot.Float32Reader, volume float32) (output.Output, error) {
 			out.source = reader.(*SwitchingAudioSource)
 			return out, nil
