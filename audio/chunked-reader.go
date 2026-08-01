@@ -19,8 +19,12 @@ import (
 )
 
 const (
-	DefaultChunkSize = 512 * 1024
-	PrefetchCount    = 3
+	// Sized for small-RAM embedded targets (~120 MB total): a 256 KiB chunk
+	// with two prefetched chunks keeps the ahead-of-position window at
+	// 512 KiB instead of 1.5 MiB, and halves the synchronous first-chunk
+	// fetch before playback can start.
+	DefaultChunkSize = 256 * 1024
+	PrefetchCount    = 2
 )
 
 var contentRangeRegexp = regexp.MustCompile("^bytes (\\d+)-(\\d+)/(\\d+)$")
