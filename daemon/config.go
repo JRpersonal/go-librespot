@@ -7,16 +7,15 @@ type Config struct {
 	DeviceType  string
 	ClientToken string
 
-	AudioBackend               string
-	AudioBackendRuntimeSocket  string
-	AudioDevice                string
-	MixerDevice                string
-	MixerControlName           string
-	AudioBufferTime            int
-	AudioPeriodCount           int
-	AudioOutputPipe            string
-	AudioOutputPipeFormat      string
-	AudioOutputPipePassthrough bool
+	AudioBackend              string
+	AudioBackendRuntimeSocket string
+	AudioDevice               string
+	MixerDevice               string
+	MixerControlName          string
+	AudioBufferTime           int
+	AudioPeriodCount          int
+	AudioOutputPipe           string
+	AudioOutputPipeFormat     string
 
 	Bitrate                   int
 	VolumeSteps               uint32

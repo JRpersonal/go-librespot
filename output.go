@@ -19,10 +19,10 @@ type AudioSource interface {
 
 // AudioSourcePassthrough is an AudioSource that can additionally hand out the
 // raw encoded (Ogg/Vorbis) bytes instead of decoded float32 samples. It backs
-// the pipe backend's passthrough mode: the decoder is bypassed and the
-// container is written to the pipe untouched, so a downstream consumer (e.g.
-// a hardware decoder) does the decoding. ReadBytes and Read must not be mixed
-// on the same source.
+// the pipe_passthrough backend: the decoder is bypassed and the container is
+// written to the pipe untouched, so a downstream consumer (e.g. a hardware
+// decoder) does the decoding. ReadBytes and Read must not be mixed on the
+// same source.
 type AudioSourcePassthrough interface {
 	AudioSource
 

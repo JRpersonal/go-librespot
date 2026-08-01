@@ -71,7 +71,8 @@
           "enum": [
             "alsa",
             "pulseaudio",
-            "pipe"
+            "pipe",
+            "pipe_passthrough"
           ],
           "default": "alsa"
         },
@@ -107,7 +108,7 @@
         },
         "audio_output_pipe": {
           "type": "string",
-          "description": "The path to an existing FIFO for the pipe audio backend",
+          "description": "The path to an existing FIFO for the pipe and pipe_passthrough audio backends",
           "default": ""
         },
         "audio_output_pipe_format": {
@@ -119,6 +120,11 @@
             "f32le"
           ],
           "default": "s16le"
+        },
+        "audio_output_pipe_passthrough": {
+          "type": "boolean",
+          "description": "Deprecated alias: together with the pipe audio backend this selects the pipe_passthrough backend. Use audio_backend 'pipe_passthrough' instead",
+          "default": false
         },
         "server": {
           "type": "object",

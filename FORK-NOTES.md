@@ -4,12 +4,17 @@ Fork of [devgianlu/go-librespot](https://github.com/devgianlu/go-librespot)
 for the SoundTouch Reborn project
 (https://github.com/JRpersonal/streborn).
 
-## audio_output_pipe_passthrough (pipe backend)
+## pipe_passthrough backend
 
 Writes the raw Ogg/Vorbis bitstream to the output pipe untouched instead of
 decoded PCM, so a downstream consumer (a hardware decoder) does the decoding.
-Enable with `audio_backend: pipe` + `audio_output_pipe_passthrough: true`
-(`audio_output_pipe_format` is then ignored).
+Enable with `audio_backend: pipe_passthrough` (`audio_output_pipe` must be
+set as for the pipe backend; `audio_output_pipe_format` does not apply).
+
+Deprecated alias: the feature used to be a mode of the pipe backend, enabled
+with `audio_backend: pipe` + `audio_output_pipe_passthrough: true`. That
+combination is still accepted and is normalized to the `pipe_passthrough`
+backend at config load, with a deprecation warning in the log.
 
 Why: on weak ARM hardware that decodes Vorbis natively (the Bose SoundTouch
 speakers STR revives), decoding to float32 PCM in go-librespot and re-streaming
@@ -20,7 +25,8 @@ Caveats: no volume scaling / normalisation in passthrough (the stream is
 untouched, use `external_volume` + downstream volume); seeking is limited to a
 restart (a mid-stream seek is reported as an error so controllers snap back to
 the real position); crossfade is disabled under passthrough (mixing requires
-decoded samples); pipe backend only; Ogg/Vorbis only (no FLAC passthrough).
+decoded samples); named-pipe output only; Ogg/Vorbis only (no FLAC
+passthrough).
 
 ## Robustness fixes on top of upstream
 

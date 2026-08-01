@@ -21,8 +21,8 @@ const (
 	maxOggPageSize = oggHeaderFixedSize + 255 + 255*255 // 65307
 )
 
-// passthroughSource hands out a track's raw Ogg/Vorbis bytes for the pipe
-// backend's passthrough mode, bypassing the Vorbis decoder. The decrypted
+// passthroughSource hands out a track's raw Ogg/Vorbis bytes for the
+// pipe_passthrough backend, bypassing the Vorbis decoder. The decrypted
 // Spotify stream is a complete Ogg bitstream starting at offset 0, so it is
 // written through untouched. Position is approximated from bytes consumed;
 // seeking is limited to a restart because a mid-page byte seek would corrupt

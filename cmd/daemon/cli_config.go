@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/devgianlu/go-librespot/daemon"
+	"github.com/devgianlu/go-librespot/output"
 	"github.com/gofrs/flock"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/confmap"
@@ -35,16 +36,22 @@ type cliConfig struct {
 	DeviceType  string `koanf:"device_type"`
 	ClientToken string `koanf:"client_token"`
 
-	AudioBackend               string `koanf:"audio_backend"`
-	AudioBackendRuntimeSocket  string `koanf:"audio_backend_runtime_socket"`
-	AudioDevice                string `koanf:"audio_device"`
-	MixerDevice                string `koanf:"mixer_device"`
-	MixerControlName           string `koanf:"mixer_control_name"`
-	AudioBufferTime            int    `koanf:"audio_buffer_time"`
-	AudioPeriodCount           int    `koanf:"audio_period_count"`
-	AudioOutputPipe            string `koanf:"audio_output_pipe"`
-	AudioOutputPipeFormat      string `koanf:"audio_output_pipe_format"`
-	AudioOutputPipePassthrough bool   `koanf:"audio_output_pipe_passthrough"`
+	AudioBackend              string `koanf:"audio_backend"`
+	AudioBackendRuntimeSocket string `koanf:"audio_backend_runtime_socket"`
+	AudioDevice               string `koanf:"audio_device"`
+	MixerDevice               string `koanf:"mixer_device"`
+	MixerControlName          string `koanf:"mixer_control_name"`
+	AudioBufferTime           int    `koanf:"audio_buffer_time"`
+	AudioPeriodCount          int    `koanf:"audio_period_count"`
+	AudioOutputPipe           string `koanf:"audio_output_pipe"`
+	AudioOutputPipeFormat     string `koanf:"audio_output_pipe_format"`
+
+	// AudioOutputPipePassthrough is deprecated: passthrough used to be a mode
+	// of the pipe backend enabled by this flag, and is now a backend of its
+	// own (pipe_passthrough). The key is kept so existing configurations keep
+	// working; loadCLIConfig normalizes it onto AudioBackend and it is never
+	// read anywhere else.
+	AudioOutputPipePassthrough bool `koanf:"audio_output_pipe_passthrough"`
 
 	Bitrate                       int      `koanf:"bitrate"`
 	VolumeSteps                   uint32   `koanf:"volume_steps"`
@@ -102,16 +109,15 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		DeviceType:  c.DeviceType,
 		ClientToken: c.ClientToken,
 
-		AudioBackend:               c.AudioBackend,
-		AudioBackendRuntimeSocket:  c.AudioBackendRuntimeSocket,
-		AudioDevice:                c.AudioDevice,
-		MixerDevice:                c.MixerDevice,
-		MixerControlName:           c.MixerControlName,
-		AudioBufferTime:            c.AudioBufferTime,
-		AudioPeriodCount:           c.AudioPeriodCount,
-		AudioOutputPipe:            c.AudioOutputPipe,
-		AudioOutputPipeFormat:      c.AudioOutputPipeFormat,
-		AudioOutputPipePassthrough: c.AudioOutputPipePassthrough,
+		AudioBackend:              c.AudioBackend,
+		AudioBackendRuntimeSocket: c.AudioBackendRuntimeSocket,
+		AudioDevice:               c.AudioDevice,
+		MixerDevice:               c.MixerDevice,
+		MixerControlName:          c.MixerControlName,
+		AudioBufferTime:           c.AudioBufferTime,
+		AudioPeriodCount:          c.AudioPeriodCount,
+		AudioOutputPipe:           c.AudioOutputPipe,
+		AudioOutputPipeFormat:     c.AudioOutputPipeFormat,
 
 		Bitrate:                   c.Bitrate,
 		VolumeSteps:               c.VolumeSteps,
@@ -252,6 +258,11 @@ func loadCLIConfig(cfg *cliConfig) error {
 		return fmt.Errorf("failed to unmarshal configuration: %w", err)
 	}
 
+	if normalized, legacy := normalizeAudioBackend(cfg.AudioBackend, cfg.AudioOutputPipePassthrough); legacy {
+		log.Warnf("audio_output_pipe_passthrough is deprecated, use audio_backend: %s instead", output.BackendPipePassthrough)
+		cfg.AudioBackend = normalized
+	}
+
 	if cfg.DeviceName == "" {
 		cfg.DeviceName = "go-librespot"
 
@@ -266,6 +277,21 @@ func loadCLIConfig(cfg *cliConfig) error {
 	}
 
 	return nil
+}
+
+// normalizeAudioBackend resolves the deprecated audio_output_pipe_passthrough
+// flag onto its replacement: passthrough used to be a mode of the pipe
+// backend, and is now the pipe_passthrough backend. An old-style
+// configuration (audio_backend: pipe plus the flag) selects the new backend;
+// a new-style configuration names the backend directly, in which case the
+// flag is redundant and ignored. On any other backend the flag has never
+// done anything and stays ignored. The second return value reports whether
+// the deprecated flag was applied, so the caller can log a deprecation note.
+func normalizeAudioBackend(backend string, pipePassthrough bool) (string, bool) {
+	if pipePassthrough && backend == "pipe" {
+		return output.BackendPipePassthrough, true
+	}
+	return backend, false
 }
 
 // parseSize parses a human-readable size string such as "1GB", "500MB" or a

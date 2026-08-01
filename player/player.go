@@ -184,11 +184,6 @@ type Options struct {
 	//
 	// This is only supported on the pipe backend.
 	AudioOutputPipeFormat string
-
-	// AudioOutputPipePassthrough writes the raw encoded Ogg/Vorbis stream to
-	// the pipe instead of decoded PCM (no decode, no volume). Only supported
-	// on the pipe backend.
-	AudioOutputPipePassthrough bool
 }
 
 func NewPlayer(opts *Options) (*Player, error) {
@@ -201,7 +196,7 @@ func NewPlayer(opts *Options) (*Player, error) {
 		cache:                     opts.Cache,
 		cdnQuarantine:             make(map[string]time.Time),
 		flacEnabled:               opts.FlacEnabled,
-		passthrough:               opts.AudioOutputPipePassthrough,
+		passthrough:               opts.AudioBackend == output.BackendPipePassthrough,
 		normalisationEnabled:      opts.NormalisationEnabled,
 		normalisationUseAlbumGain: opts.NormalisationUseAlbumGain,
 		normalisationPregain:      opts.NormalisationPregain,
@@ -224,7 +219,6 @@ func NewPlayer(opts *Options) (*Player, error) {
 				VolumeUpdate:     opts.VolumeUpdate,
 				OutputPipe:       opts.AudioOutputPipe,
 				OutputPipeFormat: opts.AudioOutputPipeFormat,
-				Passthrough:      opts.AudioOutputPipePassthrough,
 			})
 		},
 
@@ -238,7 +232,7 @@ func NewPlayer(opts *Options) (*Player, error) {
 		// encoded stream to the pipe without ever decoding it, so the two
 		// features are mutually exclusive. Passthrough wins: warn and
 		// disable crossfade instead of failing playback.
-		p.log.Warnf("crossfade_duration is ignored: crossfading requires decoding, which pipe passthrough bypasses")
+		p.log.Warnf("crossfade_duration is ignored: crossfading requires decoding, which the %s backend bypasses", output.BackendPipePassthrough)
 		p.crossfadeSamples = 0
 	}
 
