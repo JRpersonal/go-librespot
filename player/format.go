@@ -6,6 +6,14 @@ import (
 
 func GetFormatBitrate(format metadatapb.AudioFile_Format) int {
 	switch format {
+	case metadatapb.AudioFile_MP3_96:
+		return 96
+	case metadatapb.AudioFile_MP3_160:
+		return 160
+	case metadatapb.AudioFile_MP3_256:
+		return 256
+	case metadatapb.AudioFile_MP3_320:
+		return 320
 	case metadatapb.AudioFile_OGG_VORBIS_96:
 		return 96
 	case metadatapb.AudioFile_OGG_VORBIS_160:
@@ -14,6 +22,23 @@ func GetFormatBitrate(format metadatapb.AudioFile_Format) int {
 		return 320
 	default:
 		return 0
+	}
+}
+
+// GetFormatCodec returns the codec name of a format, for reporting through the
+// API. Note that a format may be named here without being decodable.
+func GetFormatCodec(format metadatapb.AudioFile_Format) string {
+	switch GetAudioFileFormatAudioFormat(format) {
+	case AudioFormatOGGVorbis:
+		return "vorbis"
+	case AudioFormatFLAC:
+		return "flac"
+	case AudioFormatMP3:
+		return "mp3"
+	case AudioFormatAAC:
+		return "aac"
+	default:
+		return "unknown"
 	}
 }
 

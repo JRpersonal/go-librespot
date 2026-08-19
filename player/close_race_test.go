@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build test_unit && !windows
 
 // Regression for the production "panic: send on closed channel" caught
 // during Spotify transfer storms: playback got transferred away (zeroconf

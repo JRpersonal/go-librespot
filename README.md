@@ -25,6 +25,8 @@
 - 🔊 **Multiple audio backends** — ALSA, PulseAudio, or a raw named pipe for custom routing.
 - 📊 **Loudness normalization** — Spotify-standard −14 LUFS (ITU-R BS.1770) with configurable pregain.
 - 🔀 **Crossfade** — configurable overlap between consecutive tracks.
+- 🎙️ **Podcast resume** — episodes pick up where you left off, and progress syncs back to your other devices.
+- 🎧 **DJ X** — Spotify's AI DJ, narration included: the spoken lines are synthesized and played around each track.
 - 🎚️ **Flexible volume control** — independent, synchronized with the ALSA mixer, or fully external.
 - 💾 **On-disk audio cache** — skip re-downloading tracks, bounded by an LRU size limit.
 - 🔐 **Multiple login flows** — Zeroconf discovery, interactive OAuth, or a Spotify access token.
@@ -64,14 +66,14 @@ brew install go-librespot
 To build from source the following prerequisites are necessary:
 
 - Go 1.25 or higher
-- Libraries: `libogg`, `libvorbis`, `flac`, `libasound2`
+- Libraries: `libogg`, `libvorbis`, `flac`, `mpg123`, `libasound2`
 
 To install Go, download it from the [Go website](https://go.dev/dl/).
 
 To install the required libraries on Debian-based systems (Debian, Ubuntu, Raspbian), use:
 
 ```shell
-sudo apt-get install libogg-dev libvorbis-dev libflac-dev libasound2-dev
+sudo apt-get install libogg-dev libvorbis-dev libflac-dev libmpg123-dev libasound2-dev
 ```
 
 Once prerequisites are installed you can clone the repository and run the daemon with:
@@ -256,7 +258,14 @@ initial_volume: 100 # Initial volume in steps (not applied to the mixer device)
 ignore_last_volume: false # Whether to ignore the last saved volume and always use initial_volume
 external_volume: false # Whether volume is controlled externally 
 disable_autoplay: false # Whether autoplay of more songs should be disabled
+prefer_firewall_friendly_ports: false # Whether to try accesspoints on 443 and 80 before the default 4070
 ```
+
+If your network only allows outbound HTTP and HTTPS, set
+`prefer_firewall_friendly_ports: true`. Spotify offers each accesspoint on
+4070, 443 and 80 and normally lists 4070 first, which restrictive firewalls
+tend to block; enabling this tries 443 first, then 80, and falls back to 4070.
+The dealer and spclient are unaffected, as they already use 443.
 
 Make sure to check [here](/config_schema.json) for the full list of options.
 

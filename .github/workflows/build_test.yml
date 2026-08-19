@@ -22,16 +22,22 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libvorbis-dev libogg-dev libflac-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libvorbis-dev libogg-dev libflac-dev libmpg123-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
-        run: brew install libogg libvorbis flac
+        run: brew install libogg libvorbis flac mpg123
 
       - name: Check dependencies
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+      - name: Check generated code is up to date
+        if: runner.os == 'Linux'
+        run: |
+          go generate ./...
+          test -z "$(git status --porcelain)" || { git status --porcelain; exit 1; }
 
       - name: Format
         run: test -z "$(gofmt -l .)"
@@ -41,3 +47,15 @@ jobs:
 
       - name: Test
         run: go test -v -tags "test_unit test_integration" ./...
+
+      - name: Coverage
+        if: runner.os == 'Linux'
+        run: ./coverage.sh
+
+      - name: Upload coverage profile
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out.filtered
+          if-no-files-found: error

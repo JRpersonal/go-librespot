@@ -2,12 +2,17 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
+	"maps"
+	"net"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/dealer"
 	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"github.com/devgianlu/go-librespot/tracks"
 )
 
@@ -113,6 +118,65 @@ func (s *State) playOrigin() string {
 	return s.player.PlayOrigin.FeatureIdentifier
 }
 
+// deviceAddressMask reports this device's own address in CIDR form, which is
+// what the official client puts in its device_address_mask metadata: the
+// interface address and its prefix length, not the network address, so
+// "192.168.1.20/24" rather than "192.168.1.0/24". Devices reporting the same
+// subnet are the ones the backend can consider to be on a local network
+// together.
+//
+// Only IPv4, matching the official client. Returns empty when nothing suitable
+// is found, in which case the entry is omitted rather than sent blank.
+func deviceAddressMask() string {
+	// Which address the host would use to reach the outside. A UDP socket is
+	// only bound, never sends anything, so the destination is a documentation
+	// address that is never routed anywhere.
+	var local net.IP
+	if conn, err := net.Dial("udp4", "192.0.2.1:9"); err == nil {
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+			local = addr.IP
+		}
+		_ = conn.Close()
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	// The prefix length only comes from the interface, so the address found
+	// above still has to be located among them. Without a default route (or on
+	// a host that failed the dial) fall back to the first candidate instead.
+	var fallback string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+
+			ones, _ := ipNet.Mask.Size()
+			cidr := fmt.Sprintf("%s/%d", ipNet.IP.To4(), ones)
+			if local != nil && ipNet.IP.Equal(local) {
+				return cidr
+			} else if fallback == "" {
+				fallback = cidr
+			}
+		}
+	}
+
+	return fallback
+}
+
 func (p *AppPlayer) initState() {
 	p.state = &State{
 		lastCommand: nil,
@@ -125,6 +189,9 @@ func (p *AppPlayer) initState() {
 			DeviceSoftwareVersion: librespot.VersionString(),
 			ClientId:              librespot.ClientIdHex,
 			SpircVersion:          "3.2.6",
+			Brand:                 "spotify",
+			Model:                 "go-librespot",
+			License:               "premium",
 			Capabilities: &connectpb.Capabilities{
 				CanBePlayer:                true,
 				RestrictToLocal:            false,
@@ -150,9 +217,16 @@ func (p *AppPlayer) initState() {
 				SupportsSetOptionsCommand:  true,
 				SupportsHifi:               nil, // TODO: nice to have?
 				ConnectCapabilities:        "",
+				SupportsDj:                 true,
 			},
 		},
 	}
+
+	p.state.device.MetadataMap = map[string]string{"tier1_port": "0"}
+	if mask := deviceAddressMask(); mask != "" {
+		p.state.device.MetadataMap["device_address_mask"] = mask
+	}
+
 	p.state.reset()
 }
 
@@ -180,6 +254,13 @@ func (p *AppPlayer) updateState(ctx context.Context) {
 // or a misbehaving endpoint would block the entire event loop for minutes
 // (dealer requests, API requests and player events all stall behind it).
 const statePutTimeout = 10 * time.Second
+
+func contextMetadata(fromCommand, fromResolver map[string]string) map[string]string {
+	metadata := make(map[string]string, len(fromCommand)+len(fromResolver))
+	maps.Copy(metadata, fromCommand)
+	maps.Copy(metadata, fromResolver)
+	return metadata
+}
 
 func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutStateReason) error {
 	ctx, cancel := context.WithTimeout(ctx, statePutTimeout)
@@ -214,5 +295,100 @@ func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutSta
 	}
 
 	// finally send the state update
-	return p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
+	cluster, err := p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
+	if err != nil {
+		return err
+	}
+
+	if device := cluster.Device[p.app.deviceId]; device != nil && device.PublicIp != "" {
+		p.state.device.PublicIp = device.PublicIp
+	}
+
+	return nil
+}
+
+// coverImageSizes maps the ProvidedTrack metadata keys Spotify's clients look
+// for to the image size each should resolve to. Every key is filled from the
+// closest size the media actually carries.
+var coverImageSizes = map[string]string{
+	"image_small_url":  "small",
+	"image_url":        "default",
+	"image_large_url":  "large",
+	"image_xlarge_url": "xlarge",
+}
+
+// enrichTrackMetadata adds the metadata controllers use to draw the
+// now-playing view: the title, album and artwork of the media that is actually
+// loaded.
+//
+// Only the context resolver's own metadata reaches us through
+// ContextTrackToProvidedTrack, and it never carries any of this: an album
+// context arrives with nothing at all, a playlist context with bookkeeping like
+// added_at. The values here come from the media fetched to play the audio.
+func enrichTrackMetadata(provided *connectpb.ProvidedTrack, media *librespot.Media) {
+	if provided == nil || media == nil {
+		return
+	}
+
+	// ContextTrackToProvidedTrack hands over the ContextTrack's own map, so
+	// copy before adding: writing in place would edit the track list too.
+	metadata := make(map[string]string, len(provided.Metadata)+len(coverImageSizes)+4)
+	maps.Copy(metadata, provided.Metadata)
+
+	set := func(key, value string) {
+		if len(value) > 0 {
+			metadata[key] = value
+		}
+	}
+	setUri := func(key string, typ librespot.SpotifyIdType, gid []byte) string {
+		// SpotifyIdFromGid panics on a malformed gid, and metadata off the
+		// wire is not worth trusting that far.
+		if len(gid) != 16 {
+			return ""
+		}
+
+		uri := librespot.SpotifyIdFromGid(typ, gid).Uri()
+		set(key, uri)
+		return uri
+	}
+
+	var covers []*metadatapb.Image
+	if media.IsTrack() {
+		track := media.Track()
+		set("title", track.GetName())
+
+		if album := track.GetAlbum(); album != nil {
+			set("album_title", album.GetName())
+			provided.AlbumUri = setUri("album_uri", librespot.SpotifyIdTypeAlbum, album.GetGid())
+
+			covers = album.GetCover()
+			if len(covers) == 0 {
+				covers = album.GetCoverGroup().GetImage()
+			}
+		}
+
+		if artists := track.GetArtist(); len(artists) > 0 {
+			provided.ArtistUri = setUri("artist_uri", librespot.SpotifyIdTypeArtist, artists[0].GetGid())
+		}
+	} else {
+		episode := media.Episode()
+		set("title", episode.GetName())
+
+		// An episode has no album; controllers show the show in its place,
+		// which is also what the API response does.
+		if show := episode.GetShow(); show != nil {
+			set("album_title", show.GetName())
+			provided.AlbumUri = setUri("album_uri", librespot.SpotifyIdTypeShow, show.GetGid())
+		}
+
+		covers = episode.GetCoverImage().GetImage()
+	}
+
+	for key, size := range coverImageSizes {
+		if id := getBestImageIdForSize(covers, size); id != nil {
+			set(key, "spotify:image:"+hex.EncodeToString(id))
+		}
+	}
+
+	provided.Metadata = metadata
 }
