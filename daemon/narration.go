@@ -6,6 +6,7 @@ import (
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
+	"github.com/devgianlu/go-librespot/output"
 	"github.com/devgianlu/go-librespot/player"
 	narrationpb "github.com/devgianlu/go-librespot/proto/spotify/narration"
 )
@@ -133,6 +134,13 @@ func (p *AppPlayer) narrationFor(ctx context.Context, metadata map[string]string
 // would be heard for as long as the synthesis takes.
 func (p *AppPlayer) narrate(ctx context.Context, metadata map[string]string, uri string,
 	source librespot.AudioSource, introPrefix string) librespot.AudioSource {
+	// The passthrough backend hands the raw encoded Ogg to the pipe; a
+	// narration clip is decoded PCM and would be spliced into that bitstream
+	// as garbage the downstream decoder chokes on. Losing the DJ's line is a
+	// much smaller problem than corrupting the music: skip narration entirely.
+	if p.app.cfg.AudioBackend == output.BackendPipePassthrough {
+		return source
+	}
 	intro := p.narrationFor(ctx, metadata, uri, introPrefix)
 	outro := p.narrationFor(ctx, metadata, uri, narrationOutroPrefix)
 
