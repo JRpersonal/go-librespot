@@ -77,10 +77,6 @@ type Player struct {
 	startedPlaying time.Time
 }
 
-// ErrPlayerClosed is returned by player commands issued after (or racing)
-// Close: the command loop is gone and the command was dropped.
-var ErrPlayerClosed = errors.New("player closed")
-
 type playerCmdType int
 
 const (
