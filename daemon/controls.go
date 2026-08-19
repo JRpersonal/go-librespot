@@ -117,14 +117,25 @@ func (p *AppPlayer) emitMprisUpdate(playbackStatus mpris.PlaybackStatus) {
 		mpris.MediaState{
 			PlaybackStatus: playbackStatus,
 			LoopStatus: mpris.GetLoopStatus(
-				p.state.player.Options.RepeatingContext, p.state.player.Options.RepeatingTrack),
-			Shuffle:    p.state.player.Options.ShufflingContext,
+				p.state.player.Options.GetRepeatingContext(), p.state.player.Options.GetRepeatingTrack()),
+			Shuffle:    p.state.player.Options.GetShufflingContext(),
 			Volume:     float64(p.state.device.Volume) / float64(player.MaxStateVolume),
 			PositionMs: p.state.player.Position,
 			Uri:        trackUri,
 			Media:      media,
 		},
 	)
+}
+
+// currentTrackOrNil is p.state.tracks.CurrentTrack() behind a nil guard. A
+// player event can arrive while no track list is loaded at all (live crash
+// 2026-08-19: a pause event fired right after playback was transferred away,
+// and the raw deref took the daemon down with a SIGSEGV mid-handover).
+func (p *AppPlayer) currentTrackOrNil() *connectpb.ProvidedTrack {
+	if p.state.tracks == nil {
+		return nil
+	}
+	return p.state.tracks.CurrentTrack()
 }
 
 func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
@@ -142,9 +153,9 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 		p.sess.Events().OnPlayerPlay(
 			p.primaryStream,
 			p.state.player.ContextUri,
-			p.state.player.Options.ShufflingContext,
+			p.state.player.Options.GetShufflingContext(),
 			p.state.player.PlayOrigin,
-			p.state.tracks.CurrentTrack(),
+			p.currentTrackOrNil(),
 			p.state.trackPosition(),
 		)
 
@@ -154,7 +165,7 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 			Type: ApiEventTypePlaying,
 			Data: ApiEventDataPlaying{
 				ContextUri: p.state.player.ContextUri,
-				Uri:        p.state.player.Track.Uri,
+				Uri:        p.state.player.Track.GetUri(),
 				Resume:     false,
 				PlayOrigin: p.state.playOrigin(),
 			},
@@ -173,7 +184,7 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 			Type: ApiEventTypePlaying,
 			Data: ApiEventDataPlaying{
 				ContextUri: p.state.player.ContextUri,
-				Uri:        p.state.player.Track.Uri,
+				Uri:        p.state.player.Track.GetUri(),
 				Resume:     true,
 				PlayOrigin: p.state.playOrigin(),
 			},
@@ -187,9 +198,9 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 		p.sess.Events().OnPlayerPause(
 			p.primaryStream,
 			p.state.player.ContextUri,
-			p.state.player.Options.ShufflingContext,
+			p.state.player.Options.GetShufflingContext(),
 			p.state.player.PlayOrigin,
-			p.state.tracks.CurrentTrack(),
+			p.currentTrackOrNil(),
 			p.state.trackPosition(),
 		)
 
@@ -199,7 +210,7 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 			Type: ApiEventTypePaused,
 			Data: ApiEventDataPaused{
 				ContextUri: p.state.player.ContextUri,
-				Uri:        p.state.player.Track.Uri,
+				Uri:        p.state.player.Track.GetUri(),
 				PlayOrigin: p.state.playOrigin(),
 			},
 		})
@@ -215,7 +226,7 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 			Type: ApiEventTypeNotPlaying,
 			Data: ApiEventDataNotPlaying{
 				ContextUri: p.state.player.ContextUri,
-				Uri:        p.state.player.Track.Uri,
+				Uri:        p.state.player.Track.GetUri(),
 				PlayOrigin: p.state.playOrigin(),
 			},
 		})
@@ -690,7 +701,7 @@ func (p *AppPlayer) seek(ctx context.Context, position int64) error {
 		Type: ApiEventTypeSeek,
 		Data: ApiEventDataSeek{
 			ContextUri: p.state.player.ContextUri,
-			Uri:        p.state.player.Track.Uri,
+			Uri:        p.state.player.Track.GetUri(),
 			Position:   int(position),
 			Duration:   int(p.primaryStream.Media.Duration()),
 			PlayOrigin: p.state.playOrigin(),
