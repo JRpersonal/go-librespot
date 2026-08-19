@@ -93,7 +93,7 @@ func New(opts *Options) (*App, error) {
 		app.state = &librespot.AppState{}
 	}
 
-	app.resolver = apresolve.NewApResolver(app.log, app.client)
+	app.resolver = apresolve.NewApResolver(app.log, app.client, app.cfg.PreferFirewallFriendlyPorts)
 
 	if app.cfg.DeviceId != "" {
 		app.deviceId = app.cfg.DeviceId
@@ -211,14 +211,24 @@ func (app *App) persistState() error {
 }
 
 func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err error) {
+	playerCtx, playerCancel := context.WithCancel(ctx)
+
 	appPlayer := &AppPlayer{
 		app:             app,
+		ctx:             playerCtx,
+		cancel:          playerCancel,
 		stop:            make(chan struct{}, 1),
 		logout:          app.logoutCh,
 		countryCode:     new(string),
 		volumeUpdate:    make(chan float32, 1),
 		playbackReadyCh: make(chan struct{}),
 	}
+
+	defer func() {
+		if err != nil {
+			playerCancel()
+		}
+	}()
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
 	appPlayer.prefetchTimer.Stop()
@@ -328,6 +338,37 @@ func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
 	})
 }
 
+// activeSession is the player currently serving API requests, bundled with the
+// channel that feeds it so the two can only ever be swapped together.
+type activeSession struct {
+	player *AppPlayer
+	apiCh  chan ApiRequest
+
+	// done is closed once nothing will read apiCh again, either because the
+	// session was replaced or because its Run returned. A sender must select
+	// on it or risk blocking forever on a channel with no reader left.
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (s *activeSession) retire() {
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+// forward hands req to the session's player. It reports false if the session
+// went away first, in which case the request was not delivered and the caller
+// still owes the client a reply.
+func (s *activeSession) forward(ctx context.Context, req ApiRequest) bool {
+	select {
+	case s.apiCh <- req:
+		return true
+	case <-s.done:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Context) (*AppPlayer, error)) (err error) {
 	if !app.cfg.ZeroconfEnabled {
 		appPlayer, err := appPlayerFunc(ctx)
@@ -337,7 +378,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 			panic("zeroconf is disabled and no credentials are present")
 		}
 
-		appPlayer.Run(ctx, app.server.Receive(), app.mpris.Receive())
+		appPlayer.Run(app.server.Receive(), app.mpris.Receive())
 		return nil
 	}
 
@@ -350,41 +391,60 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 		return fmt.Errorf("failed initializing zeroconf: %w", err)
 	}
 
-	// One api channel for the app's lifetime, shared by every player
-	// incarnation and NEVER closed: the old per-player close(apiCh) raced the
-	// forwarder goroutine blocked in `apiCh <- req` — a live "panic: send on
-	// closed channel" when a Spotify transfer (zeroconf new-user) landed while
-	// an API request was in flight. A request caught mid-swap now just waits
-	// in the channel until the next player's Run drains it.
-	apiCh := make(chan ApiRequest)
+	// The session is swapped by the logout goroutine and by the zeroconf
+	// callback while the API goroutine below is forwarding requests into it.
+	// Keeping the player and its channel together behind one mutex-guarded
+	// pointer means a forwarder always sees a consistent pair, instead of a
+	// live player with the channel of the session that replaced it.
+	var sessionMu sync.Mutex
+	var current *activeSession
 
-	// currentPlayer is touched by four goroutines (forwarder, ctx/logout
-	// watcher, the zeroconf callback and this one); playerMu serializes the
-	// swaps. AppPlayer.Close is called OUTSIDE the lock — it can take time.
-	var playerMu sync.Mutex
-	var currentPlayer *AppPlayer
-
-	getPlayer := func() *AppPlayer {
-		playerMu.Lock()
-		defer playerMu.Unlock()
-		return currentPlayer
-	}
-	setPlayer := func(p *AppPlayer) {
-		playerMu.Lock()
-		currentPlayer = p
-		playerMu.Unlock()
-	}
-	// takePlayer detaches the current player (or the given one, when
-	// expected != nil) so the caller can Close it without holding the lock.
-	takePlayer := func(expected *AppPlayer) (*AppPlayer, bool) {
-		playerMu.Lock()
-		defer playerMu.Unlock()
-		if expected != nil && currentPlayer != expected {
-			return nil, false
+	// setSession installs newPlayer as the session serving API requests and
+	// tears down whichever one it replaces; a nil newPlayer just tears down.
+	setSession := func(newPlayer *AppPlayer) {
+		sessionMu.Lock()
+		prev := current
+		if newPlayer == nil {
+			current = nil
+		} else {
+			current = &activeSession{
+				player: newPlayer,
+				apiCh:  make(chan ApiRequest),
+				done:   make(chan struct{}),
+			}
 		}
-		p := currentPlayer
-		currentPlayer = nil
-		return p, p != nil
+		next := current
+		sessionMu.Unlock()
+
+		if prev != nil {
+			// Retiring the session rather than closing its channel: a request
+			// may already be on its way into apiCh, and closing underneath
+			// that send takes the whole daemon down with "send on closed
+			// channel". The forwarder watches done instead and gives up.
+			prev.retire()
+			prev.player.Close()
+		}
+
+		if next != nil {
+			go func() {
+				next.player.Run(next.apiCh, app.mpris.Receive())
+
+				// Run stopped by itself (it gives up when the dealer is
+				// unreachable): nothing will read apiCh again, so release any
+				// forwarder waiting on it rather than let it block forever.
+				next.retire()
+
+				// Drop it as the current session too, so requests get the
+				// no-session treatment instead of a session that cannot
+				// answer. Guarded because a replacement may already be in
+				// place — this also runs on an ordinary teardown.
+				sessionMu.Lock()
+				if current == next {
+					current = nil
+				}
+				sessionMu.Unlock()
+			}()
+		}
 	}
 
 	initialPlayer, err := appPlayerFunc(ctx)
@@ -396,8 +456,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 		app.log.WithField("username", librespot.ObfuscateUsername(initialPlayer.sess.Username())).
 			Debugf("initializing zeroconf session")
 
-		setPlayer(initialPlayer)
-		go initialPlayer.Run(ctx, apiCh, app.mpris.Receive())
+		setSession(initialPlayer)
 
 		app.zeroconf.SetCurrentUser(initialPlayer.sess.Username())
 	}
@@ -405,11 +464,17 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 	go func() {
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case req := <-app.server.Receive():
-				if getPlayer() == nil {
+				sessionMu.Lock()
+				sess := current
+				sessionMu.Unlock()
+
+				if sess == nil {
 					switch req.Type {
 					case ApiRequestTypeRoot:
-						req.Reply(&ApiResponseRoot{}, nil)
+						req.Reply(&ApiRoot{}, nil)
 					case ApiRequestSetDeviceName:
 						// The device name drives the zeroconf advertisement, which
 						// runs independently of any player session, so handle it
@@ -419,14 +484,12 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 					default:
 						req.Reply(nil, ErrNoSession)
 					}
-					break
+					continue
 				}
 
-				select {
-				case apiCh <- req:
-				case <-ctx.Done():
+				if !sess.forward(ctx, req) {
+					// The session went away while this request was in flight.
 					req.Reply(nil, ErrNoSession)
-					return
 				}
 			}
 		}
@@ -436,17 +499,18 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 		for {
 			select {
 			case <-ctx.Done():
-				if p, ok := takePlayer(nil); ok {
-					p.Close()
-				}
+				setSession(nil)
 				return
 			case p := <-app.logoutCh:
-				old, ok := takePlayer(p)
-				if !ok {
+				sessionMu.Lock()
+				isCurrent := current != nil && current.player == p
+				sessionMu.Unlock()
+
+				if !isCurrent {
 					continue
 				}
 
-				old.Close()
+				setSession(nil)
 
 				newAppPlayer, err := appPlayerFunc(ctx)
 				if err != nil {
@@ -456,9 +520,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				} else if newAppPlayer == nil {
 					app.zeroconf.SetCurrentUser("")
 				} else {
-					setPlayer(newAppPlayer)
-
-					go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+					setSession(newAppPlayer)
 
 					app.zeroconf.SetCurrentUser(newAppPlayer.sess.Username())
 
@@ -470,9 +532,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 	}()
 
 	return app.zeroconf.Serve(func(req zeroconf.NewUserRequest) bool {
-		if p, ok := takePlayer(nil); ok {
-			p.Close()
-		}
+		setSession(nil)
 
 		newAppPlayer, err := app.newAppPlayer(ctx, session.BlobCredentials{
 			Username: req.Username,
@@ -483,8 +543,6 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				Errorf("failed creating new session from %s", req.DeviceName)
 			return false
 		}
-
-		setPlayer(newAppPlayer)
 
 		if app.cfg.Credentials.Zeroconf.PersistCredentials {
 			app.state.Credentials.Username = newAppPlayer.sess.Username()
@@ -498,7 +556,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				Debugf("persisted zeroconf credentials")
 		}
 
-		go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+		setSession(newAppPlayer)
 		return true
 	})
 }

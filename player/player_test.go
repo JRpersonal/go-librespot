@@ -1,9 +1,13 @@
+//go:build test_unit
+
 package player
 
 import (
+	"errors"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/output"
@@ -23,6 +27,10 @@ type recordingOutput struct {
 	// dropPrimary records, once per Drop() call, the primary source observed
 	// right before the flush.
 	dropPrimary []librespot.AudioSource
+
+	// devices records, in order, the device names manageLoop opened the output
+	// on (captured by the newOutput hook).
+	devices []string
 }
 
 func (o *recordingOutput) record(name string) {
@@ -64,18 +72,21 @@ func (o *recordingOutput) snapshot() []string {
 
 // newTestPlayer builds a Player driven by manageLoop with newOutput wired to
 // the given recordingOutput, bypassing NewPlayer (which requires a real
-// spclient/session) since manageLoop only touches p.log, p.cmd, p.ev, p.done,
-// p.crossfadeSamples and p.newOutput.
+// spclient/session) since manageLoop only touches p.log, p.cmd, p.ev,
+// p.closed, p.crossfadeSamples and p.newOutput.
 func newTestPlayer(t *testing.T, out *recordingOutput) *Player {
 	t.Helper()
 
 	p := &Player{
-		log:  &librespot.NullLogger{},
-		cmd:  make(chan playerCmd),
-		ev:   make(chan Event, 128),
-		done: make(chan struct{}),
-		newOutput: func(reader librespot.Float32Reader, volume float32) (output.Output, error) {
+		log:    &librespot.NullLogger{},
+		cmd:    make(chan playerCmd),
+		ev:     make(chan Event, 128),
+		closed: make(chan struct{}),
+		newOutput: func(reader librespot.Float32Reader, volume float32, device string) (output.Output, error) {
 			out.source = reader.(*SwitchingAudioSource)
+			out.mu.Lock()
+			out.devices = append(out.devices, device)
+			out.mu.Unlock()
 			return out, nil
 		},
 	}
@@ -178,5 +189,174 @@ func TestSeekResumesOnlyWhilePlaying(t *testing.T) {
 	}
 	if !slices.Contains(callsAfter, "Drop") {
 		t.Fatalf("expected Drop during a paused seek, got calls=%v", callsAfter)
+	}
+}
+
+// TestReopenOutputSwitchesDeviceLive locks in the output-recovery behavior:
+// ReopenOutput while playing must flush and close the old output, open a new
+// one on the requested device, and resume playback — all without touching the
+// Spotify source (the same primary stream stays selected).
+func TestReopenOutputSwitchesDeviceLive(t *testing.T) {
+	a := rampSource(1000, 0, 0)
+
+	out := &recordingOutput{}
+	p := newTestPlayer(t, out)
+
+	if err := p.SetPrimaryStream(a, false, false); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	preLen := len(out.snapshot())
+
+	if err := p.ReopenOutput("hifi"); err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+
+	calls := out.snapshot()[preLen:]
+	dropIdx := slices.Index(calls, "Drop")
+	closeIdx := slices.Index(calls, "Close")
+	resumeIdx := slices.Index(calls, "Resume")
+	if dropIdx == -1 || closeIdx == -1 || resumeIdx == -1 {
+		t.Fatalf("expected Drop, Close and Resume during a live reopen, got calls=%v", calls)
+	}
+	if !(dropIdx < closeIdx && closeIdx < resumeIdx) {
+		t.Fatalf("expected Drop -> Close -> Resume order during reopen, got calls=%v", calls)
+	}
+
+	// The output must have been reopened on the requested device.
+	out.mu.Lock()
+	devices := append([]string(nil), out.devices...)
+	out.mu.Unlock()
+	if len(devices) < 2 || devices[len(devices)-1] != "hifi" {
+		t.Fatalf("expected the output to be reopened on device \"hifi\", got devices=%v", devices)
+	}
+
+	// The primary source must be unchanged: reopening the output does not touch
+	// the Spotify session.
+	out.source.cond.L.Lock()
+	cur := out.source.source[out.source.which]
+	out.source.cond.L.Unlock()
+	if cur != librespot.AudioSource(a) {
+		t.Fatalf("expected the primary source to be unchanged after reopen, got %v", cur)
+	}
+}
+
+// TestReopenOutputPausedStaysPaused ensures a reopen while paused reopens the
+// device but does NOT resume playback.
+func TestReopenOutputPausedStaysPaused(t *testing.T) {
+	a := rampSource(1000, 0, 0)
+
+	out := &recordingOutput{}
+	p := newTestPlayer(t, out)
+
+	if err := p.SetPrimaryStream(a, true, false); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	preLen := len(out.snapshot())
+
+	if err := p.ReopenOutput("hifi"); err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+
+	calls := out.snapshot()[preLen:]
+	if slices.Contains(calls, "Resume") {
+		t.Fatalf("reopen while paused must not resume playback, got calls=%v", calls)
+	}
+	if !slices.Contains(calls, "Close") {
+		t.Fatalf("expected the old output to be closed during reopen, got calls=%v", calls)
+	}
+	if !slices.Contains(calls, "Pause") {
+		t.Fatalf("expected the reopened output to be paused, got calls=%v", calls)
+	}
+}
+
+// TestReopenOutputNothingPlaying ensures a reopen with no output open is a
+// no-op that just records the device for the next output open.
+func TestReopenOutputNothingPlaying(t *testing.T) {
+	out := &recordingOutput{}
+	p := newTestPlayer(t, out)
+
+	if err := p.ReopenOutput("hifi"); err != nil {
+		t.Fatalf("reopen with nothing playing failed: %v", err)
+	}
+
+	if calls := out.snapshot(); len(calls) != 0 {
+		t.Fatalf("expected no output calls when reopening with nothing playing, got calls=%v", calls)
+	}
+
+	// The device only takes effect on the next output open: loading a stream now
+	// must open on the recorded device.
+	a := rampSource(100, 0, 0)
+	if err := p.SetPrimaryStream(a, false, false); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	out.mu.Lock()
+	devices := append([]string(nil), out.devices...)
+	out.mu.Unlock()
+	if len(devices) != 1 || devices[0] != "hifi" {
+		t.Fatalf("expected the next output to open on device \"hifi\", got devices=%v", devices)
+	}
+}
+
+// TestCommandsAfterCloseDoNotPanic locks in the fix for the "send on closed
+// channel" crash seen in the wild: manageLoop used to close p.cmd on its way
+// out, so any goroutine that was still issuing a command took the whole daemon
+// down. The daemon reaches this state routinely — AppPlayer.Close signals a
+// buffered stop and closes the player immediately, while the player's Run loop
+// may still be inside a dealer request loading a track — so a late command
+// must be an ordinary failure. Commands must also not block: nothing reads
+// p.cmd once manageLoop is gone.
+func TestCommandsAfterCloseDoNotPanic(t *testing.T) {
+	out := &recordingOutput{}
+	p := newTestPlayer(t, out)
+
+	p.Close()
+
+	// manageLoop exits asynchronously; wait for it to give up the channel.
+	select {
+	case <-p.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manage loop did not signal closure")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		// The exact call from the crash report, which returns nothing and so
+		// must simply be a no-op.
+		p.SetSecondaryStream(rampSource(100, 0, 0))
+
+		if err := p.SetPrimaryStream(rampSource(100, 0, 0), false, false); !errors.Is(err, ErrPlayerClosed) {
+			t.Errorf("SetPrimaryStream after close: got %v, want ErrPlayerClosed", err)
+		}
+		if err := p.Play(); !errors.Is(err, ErrPlayerClosed) {
+			t.Errorf("Play after close: got %v, want ErrPlayerClosed", err)
+		}
+		if err := p.Pause(); !errors.Is(err, ErrPlayerClosed) {
+			t.Errorf("Pause after close: got %v, want ErrPlayerClosed", err)
+		}
+		if err := p.SeekMs(1000); !errors.Is(err, ErrPlayerClosed) {
+			t.Errorf("SeekMs after close: got %v, want ErrPlayerClosed", err)
+		}
+		if err := p.ReopenOutput("hifi"); !errors.Is(err, ErrPlayerClosed) {
+			t.Errorf("ReopenOutput after close: got %v, want ErrPlayerClosed", err)
+		}
+		if pos := p.PositionMs(); pos != 0 {
+			t.Errorf("PositionMs after close: got %d, want 0", pos)
+		}
+
+		p.Stop()
+		p.SetVolume(MaxStateVolume / 2)
+
+		// Closing twice must not deadlock either; the cleanup hook does it a
+		// third time.
+		p.Close()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commands issued after close blocked forever")
 	}
 }
