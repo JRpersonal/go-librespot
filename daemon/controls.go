@@ -427,10 +427,25 @@ func (p *AppPlayer) loadCurrentTrack(ctx context.Context, paused, drop bool) err
 	// A prefetched stream was created at position zero, so a non-zero start
 	// position (an episode's resume point, or a transfer) has to be applied
 	// here — unlike the freshly created stream above, which is already there.
+	//
+	// A passthrough source can only restart, never jump mid-stream, and
+	// refusing the seek here failed the whole ADVANCE: the player prefetches
+	// the next track near the end of nearly every track, the natural advance
+	// carries a small non-zero position, and playback simply stopped. Heard
+	// as "only one song plays" (field trace 2026-08-21, Portable: "failed
+	// advancing to next track ... passthrough source cannot seek mid-stream"
+	// at track end, sometimes papered over by a reload, often not). Start the
+	// prefetched track from its beginning instead, the same choice
+	// AppPlayer.play already makes for the seek-before-play case; a few
+	// milliseconds of lead-in beats losing the track.
 	if prefetched && trackPosition > 0 {
 		seekTo := max(0, min(trackPosition, int64(p.primaryStream.Media.Duration())))
 		if err := p.primaryStream.Source.SetPositionMs(seekTo); err != nil {
-			return fmt.Errorf("failed seeking prefetched stream for %s: %w", spotId, err)
+			if errors.Is(err, player.ErrPassthroughCannotSeek) {
+				p.app.log.WithError(err).Warnf("cannot seek the prefetched stream to %dms, starting that track from its beginning", seekTo)
+			} else {
+				return fmt.Errorf("failed seeking prefetched stream for %s: %w", spotId, err)
+			}
 		}
 	}
 
