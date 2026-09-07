@@ -48,5 +48,14 @@ Candidates for upstreaming; kept as focused commits:
 - tracks: a paged list whose pages could not be fetched no longer panics with
   "invalid paged list position: -1" (upstream issue #324); the daemon stops
   playback cleanly instead.
+- audio: the chunked reader releases chunks the read position has long passed
+  instead of holding the whole encrypted file until the track ends. Measured
+  growth was about 1.5 MB of RSS per MB of audio, released only at the track
+  change; a single 61 minute track drove a SoundTouch 20 from 29 MB free to
+  3.8 MB free in 18 minutes. A window of 4 chunks (1 MiB) behind the position
+  is kept for short backward seeks, the prefetch ahead is untouched, and a
+  released chunk is re-downloaded transparently. Disabled while an OnComplete
+  callback is registered, because that path re-reads the whole file to fill the
+  audio cache.
 
 Everything else tracks upstream.

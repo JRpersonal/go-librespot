@@ -25,6 +25,15 @@ const (
 	// fetch before playback can start.
 	DefaultChunkSize = 256 * 1024
 	PrefetchCount    = 2
+
+	// RetainedChunksBehind is how many already-read chunks stay resident
+	// behind the read position before releaseChunksBehind hands them back to
+	// the garbage collector. Four chunks are 1 MiB, which covers the
+	// decryptor's block-aligned re-reads and a short backward seek (a few
+	// seconds of audio) without a re-download, while keeping the whole
+	// resident set at RetainedChunksBehind+1+PrefetchCount = 7 chunks
+	// (1.75 MiB) no matter how long the track is.
+	RetainedChunksBehind = 4
 )
 
 var contentRangeRegexp = regexp.MustCompile("^bytes (\\d+)-(\\d+)/(\\d+)$")
@@ -51,8 +60,16 @@ func parseContentRange(resp *http.Response) (start int64, end int64, size int64,
 
 type chunkItem struct {
 	*sync.Cond
+	// data is the downloaded payload, or nil when the chunk has not been
+	// downloaded yet, a download is in flight, or the sliding window released
+	// it again (see releaseChunksBehind). Only ever touched under L.
 	data     []byte
 	fetching bool
+	// downloaded stays true once the chunk has been fetched at least once,
+	// even after its data was released again. It keeps completedChunks a count
+	// of distinct chunks downloaded, so a re-download of a released chunk
+	// cannot make the file look complete before it is.
+	downloaded bool
 }
 
 func newChunkItem() *chunkItem {
@@ -133,6 +150,7 @@ func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl st
 	}
 
 	// The first chunk is fetched eagerly here, so count it towards completion.
+	r.chunks[0].downloaded = true
 	r.completedChunks = 1
 
 	log.Debugf("fetched first chunk of %d, total size is %d bytes", len(r.chunks), r.len)
@@ -240,10 +258,18 @@ func (r *HttpChunkedReader) fetchChunk(idx int) ([]byte, error) {
 	chunk.L.Lock()
 	chunk.data = data
 	chunk.fetching = false
+	firstDownload := !chunk.downloaded
+	chunk.downloaded = true
 	chunk.Broadcast()
 	chunk.L.Unlock()
 
-	r.markChunkComplete()
+	// Count downloads, not presence, and count each chunk only once: a chunk
+	// that the sliding window released and that is fetched again here must not
+	// be counted a second time, or completedChunks would reach the chunk count
+	// while parts of the file have never been seen.
+	if firstDownload {
+		r.markChunkComplete()
+	}
 
 	r.log.Debugf("fetched chunk %d/%d, size: %d", idx, len(r.chunks)-1, len(data))
 	if r.isClosed() {
@@ -251,6 +277,64 @@ func (r *HttpChunkedReader) fetchChunk(idx int) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// releaseChunksBehind drops the payload of the chunks the read position has
+// long passed, so that playing a track cannot pin its whole encrypted file in
+// RAM until the track ends.
+//
+// Why this exists: measured on a SoundTouch Portable (2026-09-08), resident
+// memory grew by roughly 1.5 MB per MB of audio delivered and was only handed
+// back at the track change, because NewHttpChunkedReader allocates one chunk
+// per 256 KiB of the file and nothing ever cleared chunk.data again. A field
+// report shows a single 61 minute track taking a SoundTouch 20 from 29 MB free
+// to 3.8 MB free within 18 minutes, until STR's memory guard rebooted the
+// speaker. A playlist of normal-length tracks only looked stable because every
+// track change dropped the reader. These boxes have about 120 MB of RAM in
+// total, so the stream has to be bounded rather than merely small.
+//
+// Playback is strictly sequential (the player wraps this reader in the AES
+// decryptor and, for STR, in the passthrough path), so everything from
+// RetainedChunksBehind chunks behind the position downwards is dead weight.
+// The window that is kept absorbs short backward seeks, and the prefetch ahead
+// is left untouched. Releasing costs nothing but bandwidth in the worst case:
+// fetchChunk re-downloads a chunk transparently whenever its data is nil.
+func (r *HttpChunkedReader) releaseChunksBehind(currIdx int) {
+	// Never release while a completion callback is registered: player.go uses
+	// it to persist the complete encrypted file to the audio cache, and that
+	// callback re-reads the whole file back through this reader, which would
+	// turn one pass over the file into a second full download. Guarded with
+	// completeMu, the same lock maybeFireComplete runs under. STR pins the
+	// audio cache off, so on the speakers no callback is ever registered and
+	// the window is always active.
+	r.completeMu.Lock()
+	caching := r.onComplete != nil
+	r.completeMu.Unlock()
+	if caching {
+		return
+	}
+
+	for idx := currIdx - RetainedChunksBehind - 1; idx >= 0; idx-- {
+		chunk := r.chunks[idx]
+
+		chunk.L.Lock()
+		if chunk.data == nil {
+			// Either this chunk was already released by an earlier pass (and
+			// then so is everything below it, which is what keeps this walk
+			// O(1) amortised over a sequential read), or it was never fetched,
+			// or a download is still in flight. A fetching chunk has no data
+			// yet, so it can never be released from under its downloader.
+			chunk.L.Unlock()
+			return
+		}
+
+		// Dropping the reference is safe even while another goroutine is
+		// copying out of the slice fetchChunk returned to it: that goroutine
+		// holds its own slice header, which keeps the backing array alive for
+		// as long as it needs it. Only this reader's reference goes away.
+		chunk.data = nil
+		chunk.L.Unlock()
+	}
 }
 
 func (r *HttpChunkedReader) prefetchChunks(curr int) {
@@ -306,6 +390,11 @@ func (r *HttpChunkedReader) ReadAt(p []byte, pos int64) (n int, _ error) {
 		if chunkIdx >= len(r.chunks) {
 			return n, io.EOF
 		}
+
+		// release the chunks far behind this one so a long track cannot grow
+		// the resident set without bound, also when a single call walks over
+		// many chunks
+		r.releaseChunksBehind(chunkIdx)
 
 		// get the chunk data
 		chunk, err := r.fetchChunk(chunkIdx)
@@ -393,6 +482,11 @@ func (r *HttpChunkedReader) Size() int64 {
 // an io.ReaderAt (serving the fully-buffered chunks) and the total size, which
 // allows the complete encrypted file to be persisted to a cache. If the file is
 // already fully downloaded, the callback fires immediately.
+//
+// Registering a callback also switches off the sliding window of
+// releaseChunksBehind, so the whole file stays resident for the callback to
+// read back. Callers on memory-constrained targets should not register one;
+// STR pins the audio cache off for exactly that reason.
 func (r *HttpChunkedReader) OnComplete(cb func(io.ReaderAt, int64)) {
 	r.completeMu.Lock()
 	r.onComplete = cb
