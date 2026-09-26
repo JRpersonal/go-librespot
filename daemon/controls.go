@@ -856,7 +856,8 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
 		// The prefetched stream (if any) is not the track being loaded: clear
 		// it from the player too, so an upcoming track change cannot switch
 		// or fade into a stale stream.
-		p.clearUpcoming()	}
+		p.clearUpcoming()
+	}
 
 	// Reaching a track by jumping straight to it gets the jump line, which is
 	// worded for having moved deliberately rather than arrived in turn.
