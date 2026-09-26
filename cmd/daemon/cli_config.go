@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/devgianlu/go-librespot/daemon"
 	"github.com/devgianlu/go-librespot/output"
@@ -36,15 +38,16 @@ type cliConfig struct {
 	DeviceType  string `koanf:"device_type"`
 	ClientToken string `koanf:"client_token"`
 
-	AudioBackend              string `koanf:"audio_backend"`
-	AudioBackendRuntimeSocket string `koanf:"audio_backend_runtime_socket"`
-	AudioDevice               string `koanf:"audio_device"`
-	MixerDevice               string `koanf:"mixer_device"`
-	MixerControlName          string `koanf:"mixer_control_name"`
-	AudioBufferTime           int    `koanf:"audio_buffer_time"`
-	AudioPeriodCount          int    `koanf:"audio_period_count"`
-	AudioOutputPipe           string `koanf:"audio_output_pipe"`
-	AudioOutputPipeFormat     string `koanf:"audio_output_pipe_format"`
+	AudioBackend                 string `koanf:"audio_backend"`
+	AudioBackendRuntimeSocket    string `koanf:"audio_backend_runtime_socket"`
+	AudioDevice                  string `koanf:"audio_device"`
+	MixerDevice                  string `koanf:"mixer_device"`
+	MixerControlName             string `koanf:"mixer_control_name"`
+	AudioBufferTime              int    `koanf:"audio_buffer_time"`
+	AudioPeriodCount             int    `koanf:"audio_period_count"`
+	AudioOutputPipe              string `koanf:"audio_output_pipe"`
+	AudioOutputPipeFormat        string `koanf:"audio_output_pipe_format"`
+	AudioOutputPipeWaitForReader bool   `koanf:"audio_output_pipe_wait_for_reader"`
 
 	// AudioOutputPipePassthrough is deprecated: passthrough used to be a mode
 	// of the pipe backend enabled by this flag, and is now a backend of its
@@ -61,6 +64,7 @@ type cliConfig struct {
 	NormalisationUseAlbumGain     bool     `koanf:"normalisation_use_album_gain"`
 	NormalisationPregain          float32  `koanf:"normalisation_pregain"`
 	CrossfadeDuration             int      `koanf:"crossfade_duration"`
+	SkipDebounceMs                int      `koanf:"skip_debounce_ms"`
 	ExternalVolume                bool     `koanf:"external_volume"`
 	ZeroconfEnabled               bool     `koanf:"zeroconf_enabled"`
 	ZeroconfPort                  int      `koanf:"zeroconf_port"`
@@ -88,6 +92,12 @@ type cliConfig struct {
 		SizeLimit string `koanf:"size_limit"`
 	} `koanf:"cache"`
 
+	Metadata struct {
+		Enabled      bool `koanf:"enabled"`
+		ContextSweep bool `koanf:"context_sweep"`
+		MaxTracks    int  `koanf:"max_tracks"`
+	} `koanf:"metadata"`
+
 	Credentials struct {
 		Type        string `koanf:"type"`
 		Interactive struct {
@@ -110,15 +120,16 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		DeviceType:  c.DeviceType,
 		ClientToken: c.ClientToken,
 
-		AudioBackend:              c.AudioBackend,
-		AudioBackendRuntimeSocket: c.AudioBackendRuntimeSocket,
-		AudioDevice:               c.AudioDevice,
-		MixerDevice:               c.MixerDevice,
-		MixerControlName:          c.MixerControlName,
-		AudioBufferTime:           c.AudioBufferTime,
-		AudioPeriodCount:          c.AudioPeriodCount,
-		AudioOutputPipe:           c.AudioOutputPipe,
-		AudioOutputPipeFormat:     c.AudioOutputPipeFormat,
+		AudioBackend:                 c.AudioBackend,
+		AudioBackendRuntimeSocket:    c.AudioBackendRuntimeSocket,
+		AudioDevice:                  c.AudioDevice,
+		MixerDevice:                  c.MixerDevice,
+		MixerControlName:             c.MixerControlName,
+		AudioBufferTime:              c.AudioBufferTime,
+		AudioPeriodCount:             c.AudioPeriodCount,
+		AudioOutputPipe:              c.AudioOutputPipe,
+		AudioOutputPipeFormat:        c.AudioOutputPipeFormat,
+		AudioOutputPipeWaitForReader: c.AudioOutputPipeWaitForReader,
 
 		Bitrate:                   c.Bitrate,
 		VolumeSteps:               c.VolumeSteps,
@@ -128,6 +139,7 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 		NormalisationUseAlbumGain: c.NormalisationUseAlbumGain,
 		NormalisationPregain:      c.NormalisationPregain,
 		CrossfadeDuration:         c.CrossfadeDuration,
+		SkipDebounce:              time.Duration(c.SkipDebounceMs) * time.Millisecond,
 		ExternalVolume:            c.ExternalVolume,
 		DisableAutoplay:           c.DisableAutoplay,
 
@@ -154,6 +166,9 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 	}
 	// The value is validated in loadCLIConfig, so the error is unreachable here.
 	dc.Cache.SizeLimit, _ = parseSize(c.Cache.SizeLimit)
+	dc.Metadata.Enabled = c.Metadata.Enabled
+	dc.Metadata.ContextSweep = c.Metadata.ContextSweep
+	dc.Metadata.MaxTracks = c.Metadata.MaxTracks
 	dc.Credentials.Type = c.Credentials.Type
 	dc.Credentials.Interactive.CallbackPort = c.Credentials.Interactive.CallbackPort
 	dc.Credentials.SpotifyToken.Username = c.Credentials.SpotifyToken.Username
@@ -202,7 +217,7 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"device_type": "computer",
 		"bitrate":     160,
 
-		"audio_backend":            "alsa",
+		"audio_backend":            defaultAudioBackend(),
 		"audio_device":             "default",
 		"audio_output_pipe_format": "s16le",
 		"mixer_control_name":       "Master",
@@ -210,10 +225,16 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"volume_steps":   100,
 		"initial_volume": 100,
 
+		"skip_debounce_ms": 600,
+
 		"credentials.type": "zeroconf",
 
 		"cache.enabled":    false,
 		"cache.size_limit": "1GB",
+
+		"metadata.enabled":       false,
+		"metadata.context_sweep": false,
+		"metadata.max_tracks":    800,
 
 		"zeroconf_backend": "builtin",
 
@@ -295,6 +316,17 @@ func normalizeAudioBackend(backend string, pipePassthrough bool) (string, bool) 
 		return output.BackendPipePassthrough, true
 	}
 	return backend, false
+}
+
+func defaultAudioBackend() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "wasapi"
+	case "darwin":
+		return "audio-toolbox"
+	default:
+		return "alsa"
+	}
 }
 
 // parseSize parses a human-readable size string such as "1GB", "500MB" or a

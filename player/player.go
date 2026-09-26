@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -51,7 +52,7 @@ type Player struct {
 	normalisationEnabled      bool
 	normalisationUseAlbumGain bool
 	normalisationPregain      float32
-	countryCode               *string
+	countryCode               func() string
 
 	sp       *spclient.Spclient
 	audioKey *audio.KeyProvider
@@ -75,6 +76,10 @@ type Player struct {
 	volumeSteps uint32
 
 	startedPlaying time.Time
+
+	// streamGen counts the primary streams set, so that events can say which
+	// one they came from. Written only by manageLoop, read from anywhere.
+	streamGen atomic.Uint64
 }
 
 type playerCmdType int
@@ -133,8 +138,10 @@ type Options struct {
 	// a track change. Zero disables crossfading.
 	CrossfadeDuration time.Duration
 
-	// CountryCode specifies the country code to use for media restrictions.
-	CountryCode *string
+	// CountryCode reports the country code to use for media restrictions. It is
+	// read while building a stream, which happens off the daemon's player loop,
+	// so it is a function rather than a pointer the daemon writes through.
+	CountryCode func() string
 
 	// AudioBackend specifies the audio backend to use (alsa, pulseaudio, etc).
 	AudioBackend string
@@ -184,6 +191,14 @@ type Options struct {
 	//
 	// This is only supported on the pipe backend.
 	AudioOutputPipeFormat string
+
+	// AudioOutputPipeWaitForReader makes the pipe backend wait for a reader to
+	// appear when opening the FIFO, instead of failing if none is present at the
+	// time playback starts. This is useful for readers (e.g. snapcast with
+	// dryout) that only connect to the FIFO when data is expected.
+	//
+	// This is only supported on the pipe backend.
+	AudioOutputPipeWaitForReader bool
 }
 
 func NewPlayer(opts *Options) (*Player, error) {
@@ -204,22 +219,23 @@ func NewPlayer(opts *Options) (*Player, error) {
 		defaultAudioDevice:        opts.AudioDevice,
 		newOutput: func(reader librespot.Float32Reader, volume float32, device string) (output.Output, error) {
 			return output.NewOutput(&output.NewOutputOptions{
-				Log:              opts.Log,
-				Backend:          opts.AudioBackend,
-				Reader:           reader,
-				SampleRate:       SampleRate,
-				ChannelCount:     Channels,
-				Device:           device,
-				RuntimeSocket:    opts.AudioBackendRuntimeSocket,
-				Mixer:            opts.MixerDevice,
-				Control:          opts.MixerControlName,
-				InitialVolume:    volume,
-				BufferTimeMicro:  opts.AudioBufferTime,
-				PeriodCount:      opts.AudioPeriodCount,
-				ExternalVolume:   opts.ExternalVolume,
-				VolumeUpdate:     opts.VolumeUpdate,
-				OutputPipe:       opts.AudioOutputPipe,
-				OutputPipeFormat: opts.AudioOutputPipeFormat,
+				Log:                     opts.Log,
+				Backend:                 opts.AudioBackend,
+				Reader:                  reader,
+				SampleRate:              SampleRate,
+				ChannelCount:            Channels,
+				Device:                  device,
+				RuntimeSocket:           opts.AudioBackendRuntimeSocket,
+				Mixer:                   opts.MixerDevice,
+				Control:                 opts.MixerControlName,
+				InitialVolume:           volume,
+				BufferTimeMicro:         opts.AudioBufferTime,
+				PeriodCount:             opts.AudioPeriodCount,
+				ExternalVolume:          opts.ExternalVolume,
+				VolumeUpdate:            opts.VolumeUpdate,
+				OutputPipe:              opts.AudioOutputPipe,
+				OutputPipeFormat:        opts.AudioOutputPipeFormat,
+				OutputPipeWaitForReader: opts.AudioOutputPipeWaitForReader,
 			})
 		},
 
@@ -292,7 +308,10 @@ loop:
 					_ = out.Drop()
 				}
 
-				// set source
+				// Counted before the events below so they carry the stream they
+				// describe, and so that whoever set it can tell which that was.
+				p.streamGen.Add(1)
+
 				source.SetPrimary(data.source)
 				if data.paused {
 					if err := out.Pause(); err != nil {
@@ -311,9 +330,9 @@ loop:
 				cmd.resp <- nil
 
 				if data.paused {
-					p.ev <- Event{Type: EventTypePause}
+					p.ev <- Event{Type: EventTypePause, StreamGen: p.streamGen.Load()}
 				} else {
-					p.ev <- Event{Type: EventTypePlay}
+					p.ev <- Event{Type: EventTypePlay, StreamGen: p.streamGen.Load()}
 				}
 			case playerCmdPlay:
 				if out != nil {
@@ -322,7 +341,7 @@ loop:
 					} else {
 						paused = false
 						cmd.resp <- nil
-						p.ev <- Event{Type: EventTypeResume}
+						p.ev <- Event{Type: EventTypeResume, StreamGen: p.streamGen.Load()}
 					}
 				} else {
 					paused = false
@@ -335,7 +354,7 @@ loop:
 					} else {
 						paused = true
 						cmd.resp <- nil
-						p.ev <- Event{Type: EventTypePause}
+						p.ev <- Event{Type: EventTypePause, StreamGen: p.streamGen.Load()}
 					}
 				} else {
 					paused = true
@@ -351,7 +370,7 @@ loop:
 				}
 
 				cmd.resp <- struct{}{}
-				p.ev <- Event{Type: EventTypeStop}
+				p.ev <- Event{Type: EventTypeStop, StreamGen: p.streamGen.Load()}
 			case playerCmdSeek:
 				if out != nil {
 					if err := source.SetPositionMs(cmd.data.(int64)); err != nil {
@@ -454,9 +473,9 @@ loop:
 			p.log.Tracef("cleared closed output device")
 
 			// FIXME: this is called even if not needed, like when autoplay starts
-			p.ev <- Event{Type: EventTypeStop}
+			p.ev <- Event{Type: EventTypeStop, StreamGen: p.streamGen.Load(), Err: err}
 		case <-source.Done():
-			p.ev <- Event{Type: EventTypeNotPlaying}
+			p.ev <- Event{Type: EventTypeNotPlaying, StreamGen: p.streamGen.Load()}
 		}
 	}
 
@@ -476,6 +495,13 @@ func (p *Player) HasBeenPlayingFor() time.Duration {
 	}
 
 	return time.Since(p.startedPlaying)
+}
+
+// StreamGen identifies the primary stream currently set, counting up each time
+// one is set. Read it after SetPrimaryStream to learn which generation the
+// stream just handed over is; events carry the same value.
+func (p *Player) StreamGen() uint64 {
+	return p.streamGen.Load()
 }
 
 func (p *Player) Receive() <-chan Event {
@@ -712,13 +738,13 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 	}
 
 	media := librespot.NewMediaFromTrack(&trackMeta)
-	if !isMediaRestricted(media, *p.countryCode) {
+	if !isMediaRestricted(media, p.countryCode()) {
 		return &trackMeta, nil
 	}
 
 	for _, alt := range trackMeta.Alternative {
 		media = librespot.NewMediaFromTrack(alt)
-		if !isMediaRestricted(media, *p.countryCode) {
+		if !isMediaRestricted(media, p.countryCode()) {
 			// Clear alternatives to avoid confusion
 			trackMeta.Alternative = nil
 
@@ -734,6 +760,17 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 
 	// We tried all alternatives, still restricted
 	return nil, librespot.ErrMediaRestricted
+}
+
+// StartPosition is where media of the given duration should start playing when
+// asked to start at position. A position past the end, which a transfer from a
+// client with stale playback state can carry, would end the track the moment it
+// started and skip straight to the next one, so the track starts over instead.
+func StartPosition(position, duration int64) int64 {
+	if position <= 0 || position >= duration {
+		return 0
+	}
+	return position
 }
 
 func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*Stream, error) {
@@ -777,16 +814,17 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		if p.normalisationEnabled {
+			var params *audiofilespb.NormalizationParams
 			if p.normalisationUseAlbumGain {
-				normalisationFactor = calculateNormalisationFactor(
-					audioFilesResp.DefaultAlbumNormalizationParams,
-					p.normalisationPregain,
-				)
+				params = audioFilesResp.DefaultAlbumNormalizationParams
 			} else {
-				normalisationFactor = calculateNormalisationFactor(
-					audioFilesResp.DefaultFileNormalizationParams,
-					p.normalisationPregain,
-				)
+				params = audioFilesResp.DefaultFileNormalizationParams
+			}
+
+			if params != nil {
+				normalisationFactor = calculateNormalisationFactor(params, p.normalisationPregain)
+			} else {
+				normalisationFactor = 1
 			}
 		} else {
 			normalisationFactor = 1
@@ -799,7 +837,7 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		media = librespot.NewMediaFromEpisode(&episodeMeta)
-		if isMediaRestricted(media, *p.countryCode) {
+		if isMediaRestricted(media, p.countryCode()) {
 			return nil, librespot.ErrMediaRestricted
 		}
 
@@ -957,16 +995,18 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 	}
 
 	// Seek to the correct position if needed.
-	if mediaPosition > 0 {
+	if position := StartPosition(mediaPosition, int64(media.Duration())); position > 0 {
 		if p.passthrough {
 			// A passthrough stream cannot seek (a mid-page byte seek would
 			// corrupt the Ogg bitstream). Start from the beginning instead of
 			// failing the whole stream load, e.g. on a Connect transfer that
 			// carries a mid-track position.
-			log.Warnf("passthrough stream cannot seek to %dms, starting from the beginning", mediaPosition)
-		} else if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
+			log.Warnf("passthrough stream cannot seek to %dms, starting from the beginning", position)
+		} else if err := stream.SetPositionMs(position); err != nil {
 			return nil, fmt.Errorf("failed seeking stream: %w", err)
 		}
+	} else if mediaPosition > 0 {
+		log.Debugf("start position %dms is past the end (%dms), starting from the beginning", mediaPosition, media.Duration())
 	}
 
 	streamHandedOff = true
