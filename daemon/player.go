@@ -648,12 +648,21 @@ func nonEmpty(s string) *string {
 	return &s
 }
 
+// webApiTimeout bounds one proxied Spotify Web API call.
+const webApiTimeout = 15 * time.Second
+
 func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 	switch req.Type {
 	case ApiRequestTypeRoot:
 		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
 	case ApiRequestTypeWebApi:
 		data := req.Data.(ApiRequestDataWebApi)
+		// This handler no longer receives a context (upstream dropped it from
+		// handleApiRequest), and an unbounded call out to api.spotify.com from
+		// here would sit on the request goroutine for as long as the network
+		// lets it. A Web API read is a small question; give it a small budget.
+		ctx, cancel := context.WithTimeout(context.Background(), webApiTimeout)
+		defer cancel()
 		resp, err := p.sess.WebApi(ctx, data.Method, data.Path, data.Query, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send web api request: %w", err)
