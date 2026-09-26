@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +26,7 @@ const timeout = 10 * time.Second
 type ApiServer interface {
 	Emit(ev *ApiEvent)
 	Receive() <-chan ApiRequest
+	SetAuthCode(auth *ApiDeviceAuth)
 	Close() error
 }
 
@@ -44,8 +44,56 @@ type ConcreteApiServer struct {
 
 	requests chan ApiRequest
 
-	clients     []*websocket.Conn
+	// authCode is the pending device authorization pairing code.
+	authCode atomic.Pointer[ApiDeviceAuth]
+
+	clients     []*wsClient
 	clientsLock sync.RWMutex
+}
+
+// wsEventQueueSize is how many events a websocket client may fall behind by
+// before the oldest ones start being dropped.
+const wsEventQueueSize = 64
+
+// wsClient is one connected event listener. Events are handed to its own writer
+// goroutine rather than written inline, so that a client which has stopped
+// reading cannot hold up whoever emitted the event — that is the player loop.
+type wsClient struct {
+	conn      *websocket.Conn
+	events    chan *ApiEvent
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *wsClient) close() {
+	c.closeOnce.Do(func() { close(c.done) })
+}
+
+// send queues an event, making room by discarding the oldest when the client is
+// too far behind: a listener that falls behind is better off converging on the
+// current state than replaying a stale backlog.
+func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+
+	for range 2 {
+		select {
+		case c.events <- ev:
+			return true
+		default:
+		}
+
+		select {
+		case <-c.events:
+			log.Warnf("websocket client is not keeping up, dropping an event")
+		default:
+		}
+	}
+
+	return false
 }
 
 var (
@@ -61,7 +109,6 @@ type ApiRequestType string
 
 const (
 	ApiRequestTypeRoot                ApiRequestType = "root"
-	ApiRequestTypeWebApi              ApiRequestType = "web_api"
 	ApiRequestTypeStatus              ApiRequestType = "status"
 	ApiRequestTypeResume              ApiRequestType = "resume"
 	ApiRequestTypePause               ApiRequestType = "pause"
@@ -80,7 +127,14 @@ const (
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
+	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
 )
+
+// ApiRequestDataContextTracks carries the uri query parameter of the context
+// listing request; the spec generates payloads only for request bodies.
+type ApiRequestDataContextTracks struct {
+	Uri string
+}
 
 type ApiEventType string
 
@@ -99,6 +153,7 @@ const (
 	ApiEventTypeRepeatContext  ApiEventType = "repeat_context"
 	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
 	ApiEventTypePlaybackReady  ApiEventType = "playback_ready"
+	ApiEventTypePlaybackError  ApiEventType = "playback_error"
 )
 
 type ApiRequest struct {
@@ -126,17 +181,6 @@ func NewApiRequest(t ApiRequestType, data any) (req ApiRequest, wait func(contex
 		}
 	}
 	return
-}
-
-// The request and response payloads are generated from api-spec.yml.
-// Only the payloads the spec cannot describe are declared here.
-
-// ApiRequestDataWebApi is not in the spec: /web-api/ is a catch-all proxy
-// whose path continues for any number of segments, so it is routed by hand.
-type ApiRequestDataWebApi struct {
-	Method string
-	Path   string
-	Query  url.Values
 }
 
 type apiResponse struct {
@@ -301,6 +345,16 @@ type ApiEventDataStopped struct {
 	PlayOrigin string `json:"play_origin"`
 }
 
+type ApiEventDataPlaybackError struct {
+	ContextUri string `json:"context_uri"`
+	Uri        string `json:"uri"`
+	PlayOrigin string `json:"play_origin"`
+	Stage      string `json:"stage"`
+	Kind       string `json:"kind"`
+	Unplayable bool   `json:"unplayable"`
+	Message    string `json:"message"`
+}
+
 type ApiEventDataSeek struct {
 	ContextUri string `json:"context_uri"`
 	Uri        string `json:"uri"`
@@ -352,6 +406,8 @@ func (s *StubApiServer) Receive() <-chan ApiRequest {
 	return make(<-chan ApiRequest)
 }
 
+func (s *StubApiServer) SetAuthCode(*ApiDeviceAuth) {}
+
 func (s *StubApiServer) Close() error {
 	return nil
 }
@@ -377,6 +433,9 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 			return
 		case errors.Is(resp.err, ErrTooManyRequests):
 			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy):
+			w.WriteHeader(http.StatusConflict)
 			return
 		case errors.Is(resp.err, ErrBadRequest):
 			w.WriteHeader(http.StatusBadRequest)
@@ -426,8 +485,23 @@ func (s *ConcreteApiServer) GetStatus(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
 }
 
+func (s *ConcreteApiServer) GetAuthCode(w http.ResponseWriter, _ *http.Request) {
+	auth := s.authCode.Load()
+	if auth == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(auth)
+}
+
 func (s *ConcreteApiServer) GetToken(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+}
+
+func (s *ConcreteApiServer) GetContextTracks(w http.ResponseWriter, _ *http.Request, params GetContextTracksParams) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeContextTracks, Data: ApiRequestDataContextTracks{Uri: params.Uri}}, w)
 }
 
 func (s *ConcreteApiServer) PlayerResume(w http.ResponseWriter, _ *http.Request) {
@@ -579,20 +653,6 @@ func (s *ConcreteApiServer) PlayerOutput(w http.ResponseWriter, r *http.Request)
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeReopenOutput, Data: data.Device}, w)
 }
 
-// handleWebApi proxies anything under /web-api/ to the Spotify Web API. It is
-// registered by hand rather than generated: the path continues for an
-// arbitrary number of segments, which an OpenAPI path template cannot express.
-func (s *ConcreteApiServer) handleWebApi(w http.ResponseWriter, r *http.Request) {
-	s.handleRequest(ApiRequest{
-		Type: ApiRequestTypeWebApi,
-		Data: ApiRequestDataWebApi{
-			Method: r.Method,
-			Path:   strings.TrimPrefix(r.URL.Path, "/web-api/"),
-			Query:  r.URL.Query(),
-		},
-	}, w)
-}
-
 func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{}
 	if len(s.allowOrigin) > 0 {
@@ -610,10 +670,18 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// add the client to the list
+	client := &wsClient{
+		conn:   c,
+		events: make(chan *ApiEvent, wsEventQueueSize),
+		done:   make(chan struct{}),
+	}
+
 	s.clientsLock.Lock()
-	s.clients = append(s.clients, c)
+	s.clients = append(s.clients, client)
 	s.clientsLock.Unlock()
+
+	go s.writeEvents(client)
+	defer client.close()
 
 	s.log.Debugf("new websocket client")
 
@@ -627,7 +695,7 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 			// remove the client from the list
 			s.clientsLock.Lock()
 			for i, cc := range s.clients {
-				if cc == c {
+				if cc == client {
 					s.clients = append(s.clients[:i], s.clients[i+1:]...)
 					break
 				}
@@ -640,9 +708,6 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *ConcreteApiServer) serve() {
 	m := http.NewServeMux()
-
-	// Routing comes from the spec; only the catch-all proxy is added by hand.
-	m.HandleFunc("/web-api/", s.handleWebApi)
 	handler := HandlerFromMux(s, m)
 
 	c := cors.New(cors.Options{
@@ -672,12 +737,26 @@ func (s *ConcreteApiServer) Emit(ev *ApiEvent) {
 	s.log.Tracef("emitting websocket event: %s", ev.Type)
 
 	for _, client := range s.clients {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err := wsjson.Write(ctx, client, ev)
-		cancel()
-		if err != nil {
-			// purposely do not propagate this to the caller
-			s.log.WithError(err).Error("failed communicating with websocket client")
+		client.send(s.log, ev)
+	}
+}
+
+// writeEvents delivers one client's events in order. One goroutine per client
+// rather than one per event, because listeners rely on the order they arrive in:
+// will_play before metadata, paused before playing.
+func (s *ConcreteApiServer) writeEvents(client *wsClient) {
+	for {
+		select {
+		case <-client.done:
+			return
+		case ev := <-client.events:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := wsjson.Write(ctx, client.conn, ev)
+			cancel()
+			if err != nil && !s.close.Load() {
+				// purposely do not propagate this to the caller
+				s.log.WithError(err).Error("failed communicating with websocket client")
+			}
 		}
 	}
 }
@@ -686,13 +765,18 @@ func (s *ConcreteApiServer) Receive() <-chan ApiRequest {
 	return s.requests
 }
 
+func (s *ConcreteApiServer) SetAuthCode(auth *ApiDeviceAuth) {
+	s.authCode.Store(auth)
+}
+
 func (s *ConcreteApiServer) Close() error {
 	s.close.Store(true)
 
 	// close all websocket clients
 	s.clientsLock.RLock()
 	for _, client := range s.clients {
-		_ = client.Close(websocket.StatusGoingAway, "")
+		client.close()
+		_ = client.conn.Close(websocket.StatusGoingAway, "")
 	}
 	s.clientsLock.RUnlock()
 

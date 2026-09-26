@@ -2,6 +2,7 @@ package session
 
 import (
 	"net/http"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/apresolve"
@@ -37,6 +38,28 @@ type Options struct {
 
 type InteractiveCredentials struct {
 	CallbackPort int
+}
+
+// DeviceAuthCredentials authenticates with the OAuth 2.0 device authorization
+// flow: Spotify issues a code that the user enters on another device. Nothing
+// listens on a port and no browser is needed on this machine.
+type DeviceAuthCredentials struct {
+	// OnCode, if set, is called with the pairing code as soon as Spotify
+	// issues it and with nil once it is no longer usable, so the code can be
+	// shown somewhere other than the log while the flow waits for the user.
+	OnCode func(*DeviceAuthCode)
+}
+
+// DeviceAuthCode is the pairing code of a device authorization flow waiting
+// for the user to approve it.
+type DeviceAuthCode struct {
+	// VerificationUrl is where the user approves the request. It usually
+	// already embeds UserCode.
+	VerificationUrl string
+	// UserCode is the code to enter at VerificationUrl, if prompted.
+	UserCode string
+	// ExpiresAt is when the code stops being accepted.
+	ExpiresAt time.Time
 }
 
 type SpotifyTokenCredentials struct {

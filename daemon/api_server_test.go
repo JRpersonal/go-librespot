@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +25,9 @@ import (
 // saw are readable afterwards. Built by hand rather than through NewApiServer
 // because only the struct exposes the listener address.
 type testServer struct {
-	t   *testing.T
-	url string
+	t      *testing.T
+	url    string
+	server *ConcreteApiServer
 
 	received chan ApiRequest
 }
@@ -49,6 +49,7 @@ func newTestServer(t *testing.T, reply func(req ApiRequest) (any, error)) *testS
 	ts := &testServer{
 		t:        t,
 		url:      "http://" + listener.Addr().String(),
+		server:   s,
 		received: make(chan ApiRequest, 16),
 	}
 
@@ -127,6 +128,7 @@ func body(t *testing.T, resp *http.Response) string {
 var endpointMethods = map[string][]string{
 	"/":                       {http.MethodGet},
 	"/status":                 {http.MethodGet},
+	"/auth/code":              {http.MethodGet},
 	"/token":                  {http.MethodPost},
 	"/set_device_name":        {http.MethodPost},
 	"/player/play":            {http.MethodPost},
@@ -143,6 +145,7 @@ var endpointMethods = map[string][]string{
 	"/player/shuffle_context": {http.MethodPost},
 	"/player/add_to_queue":    {http.MethodPost},
 	"/player/output":          {http.MethodPost},
+	"/context/tracks":         {http.MethodGet},
 }
 
 func TestApiRejectsWrongMethod(t *testing.T) {
@@ -173,6 +176,40 @@ func TestApiRoot(t *testing.T) {
 	require.JSONEq(t, `{"playback_ready":true}`, body(t, resp))
 
 	require.Equal(t, ApiRequestTypeRoot, ts.request().Type)
+}
+
+// The pairing code is answered from the server's own state, never forwarded:
+// the device authorization flow blocks the daemon before anything drains the
+// request channel, so a request that had to reach a player would hang for as
+// long as the code is worth having.
+func TestApiAuthCode(t *testing.T) {
+	ts := newTestServer(t, okReply)
+
+	resp := ts.do(http.MethodGet, "/auth/code", nil)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	ts.requireNoRequest()
+
+	expiry := time.Now().Add(5 * time.Minute).UTC().Truncate(time.Second)
+	ts.server.SetAuthCode(&ApiDeviceAuth{
+		Url:       "https://spotify.com/pair?code=ABCDEF",
+		Code:      "ABCDEF",
+		ExpiresAt: expiry,
+	})
+
+	resp = ts.do(http.MethodGet, "/auth/code", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	require.JSONEq(t, fmt.Sprintf(
+		`{"url":"https://spotify.com/pair?code=ABCDEF","code":"ABCDEF","expires_at":%q}`,
+		expiry.Format(time.RFC3339),
+	), body(t, resp))
+	ts.requireNoRequest()
+
+	// Cleared once the user has approved the request or the code has expired.
+	ts.server.SetAuthCode(nil)
+
+	resp = ts.do(http.MethodGet, "/auth/code", nil)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
 }
 
 func TestApiStatus(t *testing.T) {
@@ -206,22 +243,29 @@ func TestApiStatus(t *testing.T) {
 func TestApiStatusWireFormat(t *testing.T) {
 	coverUrl := "https://i.scdn.co/image/xxx"
 	bitrate, sampleRate, bitDepth := 160, 44100, 16
+	playOrigin := "go-librespot"
+	originDeviceId := "def"
+	contextUri := "spotify:playlist:xxx"
+	contextName := "Some Playlist"
 
 	ts := newTestServer(t, func(ApiRequest) (any, error) {
 		return &ApiStatus{
-			Username:       "someone",
-			DeviceId:       "abc",
-			DeviceType:     "COMPUTER",
-			DeviceName:     "test device",
-			PlayOrigin:     "go-librespot",
-			Stopped:        false,
-			Paused:         false,
-			Buffering:      false,
-			Volume:         42,
-			VolumeSteps:    100,
-			RepeatContext:  false,
-			RepeatTrack:    false,
-			ShuffleContext: false,
+			Username:           "someone",
+			DeviceId:           "abc",
+			DeviceType:         "COMPUTER",
+			DeviceName:         "test device",
+			PlayOrigin:         &playOrigin,
+			PlayOriginDeviceId: &originDeviceId,
+			ContextUri:         &contextUri,
+			ContextName:        &contextName,
+			Stopped:            false,
+			Paused:             false,
+			Buffering:          false,
+			Volume:             42,
+			VolumeSteps:        100,
+			RepeatContext:      false,
+			RepeatTrack:        false,
+			ShuffleContext:     false,
 			Track: &ApiTrack{
 				Uri:           "spotify:track:xxx",
 				Name:          "Some Song",
@@ -250,6 +294,9 @@ func TestApiStatusWireFormat(t *testing.T) {
 		"device_type": "COMPUTER",
 		"device_name": "test device",
 		"play_origin": "go-librespot",
+		"play_origin_device_id": "def",
+		"context_uri": "spotify:playlist:xxx",
+		"context_name": "Some Playlist",
 		"stopped": false,
 		"paused": false,
 		"buffering": false,
@@ -288,6 +335,12 @@ func TestApiStatusWireFormatNulls(t *testing.T) {
 
 	var got map[string]any
 	require.NoError(t, json.Unmarshal([]byte(body(t, resp)), &got))
+
+	for _, field := range []string{"play_origin", "play_origin_device_id", "context_uri", "context_name"} {
+		value, present := got[field]
+		require.True(t, present, "%s must be present", field)
+		require.Nil(t, value, "%s must be null", field)
+	}
 
 	track, ok := got["track"].(map[string]any)
 	require.True(t, ok)
@@ -549,47 +602,6 @@ func TestApiReopenOutput(t *testing.T) {
 	})
 }
 
-func TestApiWebApiPassesThroughMethodPathAndQuery(t *testing.T) {
-	ts := newTestServer(t, func(ApiRequest) (any, error) {
-		return []byte("raw-bytes"), nil
-	})
-
-	resp := ts.do(http.MethodGet, "/web-api/v1/me/player?market=from_token&limit=5", nil)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
-	require.Equal(t, "raw-bytes", body(t, resp))
-
-	req := ts.request()
-	require.Equal(t, ApiRequestTypeWebApi, req.Type)
-	data := req.Data.(ApiRequestDataWebApi)
-	require.Equal(t, http.MethodGet, data.Method)
-	require.Equal(t, "v1/me/player", data.Path)
-	require.Equal(t, "from_token", data.Query.Get("market"))
-	require.Equal(t, "5", data.Query.Get("limit"))
-}
-
-// /web-api/ is the one route registered by hand alongside the generated mux,
-// so check it still wins for every method and for paths deeper than the single
-// segment an OpenAPI path template could have described.
-func TestApiWebApiRoutingIsNotShadowedByGeneratedRoutes(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
-		for _, path := range []string{"/web-api/v1", "/web-api/v1/me/player/devices"} {
-			t.Run(method+path, func(t *testing.T) {
-				ts := newTestServer(t, func(ApiRequest) (any, error) { return []byte("ok"), nil })
-
-				resp := ts.do(method, path, nil)
-				require.Equal(t, http.StatusOK, resp.StatusCode)
-
-				req := ts.request()
-				require.Equal(t, ApiRequestTypeWebApi, req.Type)
-				data := req.Data.(ApiRequestDataWebApi)
-				require.Equal(t, method, data.Method)
-				require.Equal(t, strings.TrimPrefix(path, "/web-api/"), data.Path)
-			})
-		}
-	}
-}
-
 func TestApiErrorsMapToStatusCodes(t *testing.T) {
 	for _, tt := range []struct {
 		err  error
@@ -665,4 +677,52 @@ func TestApiEventsWebsocketReceivesEmittedEvents(t *testing.T) {
 	_, raw, err := conn.Read(ctx)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"type":"volume","data":{"value":55,"max":100}}`, string(raw))
+}
+
+// A listener that stops reading must not hold up whoever emitted the event —
+// that caller is the player loop.
+func TestApiEmitDoesNotBlockOnAStalledClient(t *testing.T) {
+	s := &ConcreteApiServer{log: &librespot.NullLogger{}}
+	client := &wsClient{
+		events: make(chan *ApiEvent, wsEventQueueSize),
+		done:   make(chan struct{}),
+	}
+
+	s.clientsLock.Lock()
+	s.clients = append(s.clients, client)
+	s.clientsLock.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range uint32(wsEventQueueSize * 4) {
+			s.Emit(&ApiEvent{Type: ApiEventTypeVolume, Data: ApiEventDataVolume{Value: i, Max: 100}})
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Emit blocked on a client that never reads")
+	}
+
+	require.Len(t, client.events, wsEventQueueSize, "the queue is bounded")
+
+	// The events kept are the most recent ones: a listener that fell behind
+	// converges on the current state rather than replaying a stale backlog.
+	ev := <-client.events
+	require.Equal(t, uint32(wsEventQueueSize*3), ev.Data.(ApiEventDataVolume).Value)
+}
+
+// Once a client is gone, sending to it reports failure instead of filling a
+// queue nobody will drain.
+func TestApiSendToClosedClientGivesUp(t *testing.T) {
+	client := &wsClient{
+		events: make(chan *ApiEvent, 1),
+		done:   make(chan struct{}),
+	}
+	client.close()
+	client.close() // idempotent: both GetEvents and Close reach for it
+
+	require.False(t, client.send(&librespot.NullLogger{}, &ApiEvent{Type: ApiEventTypeVolume}))
 }
