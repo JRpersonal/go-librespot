@@ -5,11 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"strings"
 	"sync"
@@ -648,59 +646,10 @@ func nonEmpty(s string) *string {
 	return &s
 }
 
-// webApiTimeout bounds one proxied Spotify Web API call.
-const webApiTimeout = 15 * time.Second
-
 func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 	switch req.Type {
 	case ApiRequestTypeRoot:
 		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
-	case ApiRequestTypeWebApi:
-		data := req.Data.(ApiRequestDataWebApi)
-		// This handler no longer receives a context (upstream dropped it from
-		// handleApiRequest), and an unbounded call out to api.spotify.com from
-		// here would sit on the request goroutine for as long as the network
-		// lets it. A Web API read is a small question; give it a small budget.
-		ctx, cancel := context.WithTimeout(context.Background(), webApiTimeout)
-		defer cancel()
-		resp, err := p.sess.WebApi(ctx, data.Method, data.Path, data.Query, nil, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to send web api request: %w", err)
-		}
-
-		defer func() { _ = resp.Body.Close() }()
-
-		// this is the status we want to return to client not just 500
-		switch resp.StatusCode {
-		case 400:
-			return nil, ErrBadRequest
-		case 403:
-			return nil, ErrForbidden
-		case 404:
-			return nil, ErrNotFound
-		case 405:
-			return nil, ErrMethodNotAllowed
-		case 429:
-			return nil, ErrTooManyRequests
-		}
-
-		// check for content type if not application/json
-		if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-			respBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read response body: %w", err)
-			}
-
-			return respBody, nil
-		}
-
-		// decode and return json
-		var respJson any
-		if err = json.NewDecoder(resp.Body).Decode(&respJson); err != nil {
-			return nil, fmt.Errorf("failed to decode response body: %w", err)
-		}
-
-		return respJson, nil
 	case ApiRequestTypeStatus:
 		resp := &ApiStatus{
 			Username:           p.sess.Username(),

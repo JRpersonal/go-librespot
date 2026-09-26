@@ -185,15 +185,6 @@ func newRequestBackOff(ctx context.Context) *backoff.ExponentialBackOff {
 	return bo
 }
 
-func (c *Spclient) WebApiRequest(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
-	reqPath, err := url.Parse("https://api.spotify.com/")
-	if err != nil {
-		panic("invalid api base url")
-	}
-	reqURL := reqPath.JoinPath(path)
-	return c.innerRequest(ctx, method, reqURL, query, header, body)
-}
-
 func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
 	reqUrl := c.baseUrl.JoinPath(path)
 	return c.innerRequest(ctx, method, reqUrl, query, header, body)
