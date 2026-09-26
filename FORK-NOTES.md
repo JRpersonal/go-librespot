@@ -58,4 +58,33 @@ Candidates for upstreaming; kept as focused commits:
   callback is registered, because that path re-reads the whole file to fill the
   audio cache.
 
+## Merging upstream: what has to be checked by hand
+
+The passthrough work is spread across files upstream also changes, and a clean
+merge is not proof that it survived. Twice now an upstream restructure has
+silently taken a piece of it out, and both times the symptom reached a living
+room before anyone noticed.
+
+After every upstream merge, confirm each of these on the merged tree:
+
+1. `normalizeAudioBackend` still runs in `loadCLIConfig`. Deployed speakers
+   send the deprecated `audio_backend: pipe` + `audio_output_pipe_passthrough:
+   true` form, so losing the alias breaks Spotify on every box at once.
+2. Every caller of a seek tolerates `ErrPassthroughCannotSeek`. There are three
+   (`player.NewStream`, `fetchTrack`, and the seek before play); the explicit
+   user seek in `seek()` deliberately does NOT. The 2026-09 merge re-introduced
+   a hard error in `fetchTrack`, which is the "only one song plays" bug: the
+   player prefetches near the end of nearly every track, and the advance
+   carries a small position.
+3. `player/source.go` still hands a passthrough source over only at an Ogg page
+   boundary, and `crossfadeSamples` is still zeroed under passthrough.
+4. DJ narration is still skipped under passthrough (`daemon/narration.go`).
+   Narration is decoded PCM and cannot be spliced into a raw Ogg stream.
+5. Anything upstream adds that caches per track is sized for a desktop. STR
+   pins those off from its side, but check what a new default would cost on a
+   box with about 35 MB of RAM.
+
+And then listen to a real speaker through two track changes. The build passing
+and the tests passing have both been true while the audio was wrong.
+
 Everything else tracks upstream.
