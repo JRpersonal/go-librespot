@@ -966,7 +966,16 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId, 
 		// milliseconds in rewinds a stream the output is already playing.
 		seekTo := player.StartPosition(opts.position, int64(stream.Media.Duration()))
 		if err := stream.Source.SetPositionMs(seekTo); err != nil {
-			return nil, 0, fmt.Errorf("failed seeking prefetched stream for %s: %w", spotId, err)
+			// A passthrough source can only restart, never jump mid-stream, and
+			// refusing the seek here fails the whole ADVANCE: the player
+			// prefetches the next track near the end of nearly every track, and
+			// playback simply stopped. Heard as "only one song plays" (field
+			// trace 2026-08-21, Portable). Start that track from its beginning
+			// instead; a few milliseconds of lead-in beats losing the track.
+			if !errors.Is(err, player.ErrPassthroughCannotSeek) {
+				return nil, 0, fmt.Errorf("failed seeking prefetched stream for %s: %w", spotId, err)
+			}
+			log.WithError(err).Warnf("cannot seek the prefetched stream to %dms, starting that track from its beginning", seekTo)
 		}
 	}
 

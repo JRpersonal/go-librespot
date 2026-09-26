@@ -311,13 +311,6 @@ func (p *AppPlayer) updateState() {
 	p.flushState()
 }
 
-// statePutTimeout bounds a single connect-state PUT (including its internal
-// retries). The PUT runs on the AppPlayer's single Run goroutine and callers
-// pass the app-lifetime context, so without its own deadline a wedged network
-// or a misbehaving endpoint would block the entire event loop for minutes
-// (dealer requests, API requests and player events all stall behind it).
-const statePutTimeout = 10 * time.Second
-
 func contextMetadata(fromCommand, fromResolver map[string]string) map[string]string {
 	metadata := make(map[string]string, len(fromCommand)+len(fromResolver))
 	maps.Copy(metadata, fromCommand)
