@@ -61,7 +61,7 @@ func hasResolvablePages(ctx *connectpb.Context) bool {
 }
 
 func NewContextResolver(ctx context.Context, log librespot.Logger, sp *Spclient, spotCtx *connectpb.Context) (_ *ContextResolver, err error) {
-	typ := librespot.InferSpotifyIdTypeFromContextUri(spotCtx.Uri)
+	typ := librespot.InferSpotifyIdTypeFromContext(spotCtx)
 	if typ == librespot.SpotifyIdTypeUnknown {
 		return nil, fmt.Errorf("unsupported context type: %s", spotCtx.Uri)
 	}
@@ -123,6 +123,14 @@ func (r *ContextResolver) loadPage(ctx context.Context, url string) (*connectpb.
 	}
 
 	r.log.WithField("uri", r.Uri()).Tracef("loading context page from %s", url)
+
+	if IsPlaylistPageUrl(url) {
+		page, err := r.sp.PlaylistPage(ctx, url)
+		if err != nil {
+			return nil, fmt.Errorf("failed requesting page at %s: %w", url, err)
+		}
+		return page, nil
+	}
 
 	resp, err := r.sp.RequestHm(ctx, "GET", url, nil, nil)
 	if err != nil {

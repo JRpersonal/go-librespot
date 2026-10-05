@@ -78,10 +78,14 @@ func NewSpclient(ctx context.Context, log librespot.Logger, client *http.Client,
 }
 
 func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte) (*http.Response, error) {
-	return c.innerRequestWith(ctx, c.client, method, reqUrl, query, header, body)
+	return c.innerRequestWith(ctx, c.client, method, reqUrl, query, header, body, true)
 }
 
-func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte) (*http.Response, error) {
+// innerRequestWith sends a request, renewing the access token on 401. With
+// retryTransient it also repeats the request on network errors and transient
+// statuses, which is only safe when the request is idempotent: the server may
+// have acted on it before the failure.
+func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, method string, reqUrl *url.URL, query url.Values, header http.Header, body []byte, retryTransient bool) (*http.Response, error) {
 	if query != nil {
 		reqUrl.RawQuery = query.Encode()
 	}
@@ -101,7 +105,11 @@ func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, me
 	}
 
 	if body != nil {
-		req.Header.Set("Content-Type", "application/x-protobuf")
+		// Most endpoints take plain protobuf, some (the collection service)
+		// a vendor type of their own, which the caller then sets.
+		if req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/x-protobuf")
+		}
 		req.ContentLength = int64(len(body))
 
 		req.GetBody = func() (io.ReadCloser, error) {
@@ -134,6 +142,9 @@ func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, me
 
 		resp, err := client.Do(req.WithContext(ctx))
 		if err != nil {
+			if !retryTransient {
+				return nil, backoff.Permanent(err)
+			}
 			return nil, err
 		}
 
@@ -144,7 +155,7 @@ func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, me
 			return nil, fmt.Errorf("unauthorized")
 		}
 
-		if isRetryableHTTPStatus(resp.StatusCode) {
+		if retryTransient && isRetryableHTTPStatus(resp.StatusCode) {
 			status := resp.StatusCode
 			_ = resp.Body.Close()
 			c.log.Debugf(
@@ -185,6 +196,16 @@ func newRequestBackOff(ctx context.Context) *backoff.ExponentialBackOff {
 	return bo
 }
 
+// RequestOnce is Request for requests that are not idempotent: it does not
+// repeat them on network errors or transient statuses, since the server may
+// already have acted on them, and leaves such failures to the caller. A 401
+// is still answered by renewing the token and sending again, as the server
+// refused the request.
+func (c *Spclient) RequestOnce(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
+	reqUrl := c.baseUrl.JoinPath(path)
+	return c.innerRequestWith(ctx, c.client, method, reqUrl, query, header, body, false)
+}
+
 func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
 	reqUrl := c.baseUrl.JoinPath(path)
 	return c.innerRequest(ctx, method, reqUrl, query, header, body)
@@ -194,7 +215,7 @@ func (c *Spclient) Request(ctx context.Context, method string, path string, quer
 // following it, for endpoints that answer with a Location instead of a body.
 func (c *Spclient) RequestNoRedirect(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
 	reqUrl := c.baseUrl.JoinPath(path)
-	return c.innerRequestWith(ctx, c.noRedirectClient, method, reqUrl, query, header, body)
+	return c.innerRequestWith(ctx, c.noRedirectClient, method, reqUrl, query, header, body, true)
 }
 
 // RequestHm issues a request against an hm:// URL, the form Spotify uses to name
@@ -533,6 +554,17 @@ func (e *ContextResolveError) IsAccessDenied() bool {
 func (c *Spclient) ContextResolve(ctx context.Context, uri string) (*connectpb.Context, error) {
 	if librespot.InferSpotifyIdTypeFromContextUri(uri) == librespot.SpotifyIdTypeUnknown {
 		return nil, fmt.Errorf("unsupported context type: %s", uri)
+	}
+
+	// Playlists come from the playlist service: context resolve drops the
+	// episodes of one that mixes them with tracks. Anything that goes wrong
+	// there is left to context resolve to answer, refusals included.
+	if id, err := librespot.SpotifyIdFromUri(uri); err == nil && id.Type() == librespot.SpotifyIdTypePlaylist {
+		spotCtx, err := c.PlaylistContext(ctx, *id)
+		if err == nil {
+			return spotCtx, nil
+		}
+		c.log.WithError(err).Debugf("failed building playlist context for %s, resolving it instead", uri)
 	}
 
 	resp, err := c.Request(ctx, "GET", fmt.Sprintf("/context-resolve/v1/%s", uri), nil, nil, nil)
