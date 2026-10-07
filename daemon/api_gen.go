@@ -66,6 +66,65 @@ type ApiDeviceAuth struct {
 	Url string `json:"url"`
 }
 
+// ApiLibraryPlaylist A playlist in the user's library
+type ApiLibraryPlaylist struct {
+	// CanEdit Whether the user may add items to the playlist, true for their own and for collaborative playlists
+	CanEdit bool `json:"can_edit"`
+
+	// Collaborative Whether the playlist is collaborative
+	Collaborative bool `json:"collaborative"`
+
+	// Description Playlist description, empty when it has none
+	Description string `json:"description"`
+
+	// Folder Names of the folders containing the playlist, outermost first; empty for a playlist at the top level of the library
+	Folder []string `json:"folder"`
+
+	// ImageUrl Cover image URL, null when the playlist has no explicit picture (the Spotify apps then render a mosaic of its first album covers)
+	ImageUrl *string `json:"image_url"`
+
+	// Length Number of items in the playlist
+	Length int32 `json:"length"`
+
+	// Name Playlist name
+	Name string `json:"name"`
+
+	// OwnerUsername Username of the playlist owner, "spotify" for editorial playlists
+	OwnerUsername string `json:"owner_username"`
+
+	// Uri Playlist URI
+	Uri string `json:"uri"`
+}
+
+// ApiLibraryPlaylists A page of the user's library playlists
+type ApiLibraryPlaylists struct {
+	Items []ApiLibraryPlaylist `json:"items"`
+
+	// Limit Maximum number of playlists requested
+	Limit int `json:"limit"`
+
+	// Offset Index of the first returned playlist
+	Offset int `json:"offset"`
+
+	// Total Number of playlists in the library
+	Total int `json:"total"`
+}
+
+// ApiLikedState Whether a track is in the user's Liked Songs
+type ApiLikedState struct {
+	// Liked Whether the track is in Liked Songs
+	Liked bool `json:"liked"`
+
+	// Uri Track URI
+	Uri string `json:"uri"`
+}
+
+// ApiLikedStates Liked Songs membership of the requested tracks
+type ApiLikedStates struct {
+	// Items One entry per requested URI, in request order
+	Items []ApiLikedState `json:"items"`
+}
+
 // ApiNext A skip to next payload
 type ApiNext struct {
 	// Uri The track URI to skip to. When omitted the next track in the context is played.
@@ -91,6 +150,15 @@ type ApiPlay struct {
 
 	// Uri Spotify URI to start playing
 	Uri string `json:"uri"`
+}
+
+// ApiPlaylistAddTracks An append to playlist payload
+type ApiPlaylistAddTracks struct {
+	// PlaylistUri URI of the playlist to append to
+	PlaylistUri string `json:"playlist_uri"`
+
+	// Uris Track or episode URIs to append, 1 to 50
+	Uris []string `json:"uris"`
 }
 
 // ApiRepeatContext A toggle repeating context payload
@@ -124,6 +192,15 @@ type ApiSeek struct {
 type ApiSetDeviceName struct {
 	// Name The new device name
 	Name string `json:"name"`
+}
+
+// ApiSetLiked A save to or remove from Liked Songs payload
+type ApiSetLiked struct {
+	// Liked True to add the tracks to Liked Songs, false to remove them
+	Liked bool `json:"liked"`
+
+	// Uris Track URIs, 1 to 50
+	Uris []string `json:"uris"`
 }
 
 // ApiSetVolume A set volume payload
@@ -210,8 +287,14 @@ type ApiTrack struct {
 	// AlbumName Album name
 	AlbumName string `json:"album_name"`
 
+	// AlbumUri Album URI, or the show URI for episodes (mirroring album_name); empty when unknown
+	AlbumUri string `json:"album_uri"`
+
 	// ArtistNames Artists name
 	ArtistNames []string `json:"artist_names"`
+
+	// ArtistUris Artist URIs, in the order of artist_names; empty for episodes
+	ArtistUris []string `json:"artist_uris"`
 
 	// BitDepth Bits per sample of the source audio, null for lossy formats which have no meaningful source bit depth
 	BitDepth *int `json:"bit_depth"`
@@ -268,6 +351,27 @@ type GetContextTracksParams struct {
 	Uri string `form:"uri" json:"uri"`
 }
 
+// GetLikedParams defines parameters for GetLiked.
+type GetLikedParams struct {
+	// Uris Comma-separated track URIs, 1 to 50
+	Uris []string `form:"uris" json:"uris"`
+}
+
+// GetLibraryPlaylistsParams defines parameters for GetLibraryPlaylists.
+type GetLibraryPlaylistsParams struct {
+	// Offset Index of the first playlist to return
+	Offset int `form:"offset,omitempty" json:"offset,omitempty"`
+
+	// Limit Maximum number of playlists to return, from 1 to 500
+	Limit int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// SetLikedJSONRequestBody defines body for SetLiked for application/json ContentType.
+type SetLikedJSONRequestBody = ApiSetLiked
+
+// PlaylistAddTracksJSONRequestBody defines body for PlaylistAddTracks for application/json ContentType.
+type PlaylistAddTracksJSONRequestBody = ApiPlaylistAddTracks
+
 // PlayerAddToQueueJSONRequestBody defines body for PlayerAddToQueue for application/json ContentType.
 type PlayerAddToQueueJSONRequestBody = ApiAddToQueue
 
@@ -312,6 +416,18 @@ type ServerInterface interface {
 
 	// (GET /events)
 	GetEvents(w http.ResponseWriter, r *http.Request)
+
+	// (GET /library/liked)
+	GetLiked(w http.ResponseWriter, r *http.Request, params GetLikedParams)
+
+	// (POST /library/liked)
+	SetLiked(w http.ResponseWriter, r *http.Request)
+
+	// (GET /library/playlists)
+	GetLibraryPlaylists(w http.ResponseWriter, r *http.Request, params GetLibraryPlaylistsParams)
+
+	// (POST /library/playlists/add_tracks)
+	PlaylistAddTracks(w http.ResponseWriter, r *http.Request)
 
 	// (POST /player/add_to_queue)
 	PlayerAddToQueue(w http.ResponseWriter, r *http.Request)
@@ -444,6 +560,103 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetEvents(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetLiked operation middleware
+func (siw *ServerInterfaceWrapper) GetLiked(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetLikedParams
+
+	// ------------- Required query parameter "uris" -------------
+
+	if paramValue := r.URL.Query().Get("uris"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "uris"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", false, true, "uris", r.URL.Query(), &params.Uris)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "uris", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetLiked(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SetLiked operation middleware
+func (siw *ServerInterfaceWrapper) SetLiked(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetLiked(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetLibraryPlaylists operation middleware
+func (siw *ServerInterfaceWrapper) GetLibraryPlaylists(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetLibraryPlaylistsParams
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetLibraryPlaylists(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PlaylistAddTracks operation middleware
+func (siw *ServerInterfaceWrapper) PlaylistAddTracks(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PlaylistAddTracks(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -829,6 +1042,10 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc("GET "+options.BaseURL+"/auth/code", wrapper.GetAuthCode)
 	m.HandleFunc("GET "+options.BaseURL+"/context/tracks", wrapper.GetContextTracks)
 	m.HandleFunc("GET "+options.BaseURL+"/events", wrapper.GetEvents)
+	m.HandleFunc("GET "+options.BaseURL+"/library/liked", wrapper.GetLiked)
+	m.HandleFunc("POST "+options.BaseURL+"/library/liked", wrapper.SetLiked)
+	m.HandleFunc("GET "+options.BaseURL+"/library/playlists", wrapper.GetLibraryPlaylists)
+	m.HandleFunc("POST "+options.BaseURL+"/library/playlists/add_tracks", wrapper.PlaylistAddTracks)
 	m.HandleFunc("POST "+options.BaseURL+"/player/add_to_queue", wrapper.PlayerAddToQueue)
 	m.HandleFunc("POST "+options.BaseURL+"/player/next", wrapper.PlayerNext)
 	m.HandleFunc("POST "+options.BaseURL+"/player/output", wrapper.PlayerOutput)

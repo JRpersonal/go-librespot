@@ -17,12 +17,14 @@ import (
 
 	"github.com/coder/websocket"
 	librespot "github.com/devgianlu/go-librespot"
+	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/stretchr/testify/require"
 )
 
 // testServer is a ConcreteApiServer on a random port with a stand-in for the
 // daemon: reply decides what every request resolves to, and the requests it
-// saw are readable afterwards. Built by hand rather than through NewApiServer
+// saw are readable afterwards. A nil reply leaves the requests unread, as
+// nothing reads them while the daemon is still logging in. Built by hand rather than through NewApiServer
 // because only the struct exposes the listener address.
 type testServer struct {
 	t      *testing.T
@@ -51,6 +53,10 @@ func newTestServer(t *testing.T, reply func(req ApiRequest) (any, error)) *testS
 		url:      "http://" + listener.Addr().String(),
 		server:   s,
 		received: make(chan ApiRequest, 16),
+	}
+
+	if reply == nil {
+		return ts
 	}
 
 	// Stand in for AppPlayer.Run, which is what normally drains this channel.
@@ -126,26 +132,29 @@ func body(t *testing.T, resp *http.Response) string {
 // Every endpoint and the methods it accepts. Anything else must be refused
 // before the daemon is involved.
 var endpointMethods = map[string][]string{
-	"/":                       {http.MethodGet},
-	"/status":                 {http.MethodGet},
-	"/auth/code":              {http.MethodGet},
-	"/token":                  {http.MethodPost},
-	"/set_device_name":        {http.MethodPost},
-	"/player/play":            {http.MethodPost},
-	"/player/resume":          {http.MethodPost},
-	"/player/pause":           {http.MethodPost},
-	"/player/playpause":       {http.MethodPost},
-	"/player/stop":            {http.MethodPost},
-	"/player/next":            {http.MethodPost},
-	"/player/prev":            {http.MethodPost},
-	"/player/seek":            {http.MethodPost},
-	"/player/volume":          {http.MethodGet, http.MethodPost},
-	"/player/repeat_context":  {http.MethodPost},
-	"/player/repeat_track":    {http.MethodPost},
-	"/player/shuffle_context": {http.MethodPost},
-	"/player/add_to_queue":    {http.MethodPost},
-	"/player/output":          {http.MethodPost},
-	"/context/tracks":         {http.MethodGet},
+	"/":                             {http.MethodGet},
+	"/status":                       {http.MethodGet},
+	"/auth/code":                    {http.MethodGet},
+	"/token":                        {http.MethodPost},
+	"/set_device_name":              {http.MethodPost},
+	"/player/play":                  {http.MethodPost},
+	"/player/resume":                {http.MethodPost},
+	"/player/pause":                 {http.MethodPost},
+	"/player/playpause":             {http.MethodPost},
+	"/player/stop":                  {http.MethodPost},
+	"/player/next":                  {http.MethodPost},
+	"/player/prev":                  {http.MethodPost},
+	"/player/seek":                  {http.MethodPost},
+	"/player/volume":                {http.MethodGet, http.MethodPost},
+	"/player/repeat_context":        {http.MethodPost},
+	"/player/repeat_track":          {http.MethodPost},
+	"/player/shuffle_context":       {http.MethodPost},
+	"/player/add_to_queue":          {http.MethodPost},
+	"/player/output":                {http.MethodPost},
+	"/context/tracks":               {http.MethodGet},
+	"/library/playlists":            {http.MethodGet},
+	"/library/liked":                {http.MethodGet, http.MethodPost},
+	"/library/playlists/add_tracks": {http.MethodPost},
 }
 
 func TestApiRejectsWrongMethod(t *testing.T) {
@@ -270,7 +279,9 @@ func TestApiStatusWireFormat(t *testing.T) {
 				Uri:           "spotify:track:xxx",
 				Name:          "Some Song",
 				ArtistNames:   []string{"Someone"},
+				ArtistUris:    []string{"spotify:artist:yyy"},
 				AlbumName:     "Some Album",
+				AlbumUri:      "spotify:album:zzz",
 				AlbumCoverUrl: &coverUrl,
 				Position:      1000,
 				Duration:      200000,
@@ -309,7 +320,9 @@ func TestApiStatusWireFormat(t *testing.T) {
 			"uri": "spotify:track:xxx",
 			"name": "Some Song",
 			"artist_names": ["Someone"],
+			"artist_uris": ["spotify:artist:yyy"],
 			"album_name": "Some Album",
+			"album_uri": "spotify:album:zzz",
 			"album_cover_url": "https://i.scdn.co/image/xxx",
 			"position": 1000,
 			"duration": 200000,
@@ -559,6 +572,155 @@ func TestApiAddToQueue(t *testing.T) {
 	})
 }
 
+func TestApiLibraryPlaylists(t *testing.T) {
+	t.Run("defaults the paging", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodGet, "/library/playlists", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		req := ts.request()
+		require.Equal(t, ApiRequestTypeLibraryPlaylists, req.Type)
+		require.Equal(t, ApiRequestDataLibraryPlaylists{Offset: 0, Limit: 50}, req.Data)
+	})
+
+	t.Run("forwards the paging", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodGet, "/library/playlists?offset=20&limit=500", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, ApiRequestDataLibraryPlaylists{Offset: 20, Limit: 500}, ts.request().Data)
+	})
+
+	for _, query := range []string{"limit=0", "limit=501", "offset=-1", "limit=abc"} {
+		t.Run("rejects "+query, func(t *testing.T) {
+			ts := newTestServer(t, okReply)
+
+			resp := ts.do(http.MethodGet, "/library/playlists?"+query, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			ts.requireNoRequest()
+		})
+	}
+
+	t.Run("serialises the page", func(t *testing.T) {
+		ts := newTestServer(t, func(ApiRequest) (any, error) {
+			return pageLibraryPlaylists([]ApiLibraryPlaylist{{
+				Uri:    "spotify:playlist:xxx",
+				Name:   "Mix",
+				Folder: []string{},
+			}}, 0, 50), nil
+		})
+
+		resp := ts.do(http.MethodGet, "/library/playlists", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.JSONEq(t, `{"total":1,"offset":0,"limit":50,"items":[{
+			"uri":"spotify:playlist:xxx","name":"Mix","description":"","owner_username":"",
+			"length":0,"image_url":null,"collaborative":false,"can_edit":false,"folder":[]}]}`, body(t, resp))
+	})
+}
+
+func TestApiGetLiked(t *testing.T) {
+	t.Run("forwards comma-separated uris", func(t *testing.T) {
+		ts := newTestServer(t, func(ApiRequest) (any, error) {
+			return &ApiLikedStates{Items: []ApiLikedState{{Uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC", Liked: true}}}, nil
+		})
+
+		resp := ts.do(http.MethodGet, "/library/liked?uris=spotify:track:4uLU6hMCjMI75M1A2tKUQC,spotify:track:37i9dQZF1DXcBWIGoYBM5M", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.JSONEq(t, `{"items":[{"uri":"spotify:track:4uLU6hMCjMI75M1A2tKUQC","liked":true}]}`, body(t, resp))
+
+		req := ts.request()
+		require.Equal(t, ApiRequestTypeGetLiked, req.Type)
+		require.Equal(t, []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC", "spotify:track:37i9dQZF1DXcBWIGoYBM5M"}, req.Data)
+	})
+
+	for _, query := range []string{"", "?uris=", "?uris=spotify:album:4uLU6hMCjMI75M1A2tKUQC", "?uris=nope"} {
+		t.Run("rejects "+query, func(t *testing.T) {
+			ts := newTestServer(t, okReply)
+
+			resp := ts.do(http.MethodGet, "/library/liked"+query, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			ts.requireNoRequest()
+		})
+	}
+}
+
+func TestApiSetLiked(t *testing.T) {
+	t.Run("forwards the payload", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodPost, "/library/liked", map[string]any{"uris": []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}, "liked": true})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		req := ts.request()
+		require.Equal(t, ApiRequestTypeSetLiked, req.Type)
+		require.Equal(t, ApiSetLiked{Uris: []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}, Liked: true}, req.Data)
+	})
+
+	tooMany := make([]string, 51)
+	for i := range tooMany {
+		tooMany[i] = "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
+	}
+	for name, payload := range map[string]any{
+		"missing liked": map[string]any{"uris": []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}},
+		"null liked":    map[string]any{"uris": []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}, "liked": nil},
+		"no uris":       map[string]any{"uris": []string{}, "liked": true},
+		"too many":      map[string]any{"uris": tooMany, "liked": true},
+		"not track":     map[string]any{"uris": []string{"spotify:album:4uLU6hMCjMI75M1A2tKUQC"}, "liked": true},
+		"garbage":       map[string]any{"uris": []string{"nope"}, "liked": true},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			ts := newTestServer(t, okReply)
+
+			resp := ts.do(http.MethodPost, "/library/liked", payload)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			ts.requireNoRequest()
+		})
+	}
+}
+
+func TestApiPlaylistAddTracks(t *testing.T) {
+	t.Run("forwards the payload", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodPost, "/library/playlists/add_tracks", map[string]any{
+			"playlist_uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+			"uris":         []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC", "spotify:episode:4uLU6hMCjMI75M1A2tKUQC"},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		req := ts.request()
+		require.Equal(t, ApiRequestTypePlaylistAddTracks, req.Type)
+		require.Equal(t, "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", req.Data.(ApiPlaylistAddTracks).PlaylistUri)
+	})
+
+	for name, payload := range map[string]any{
+		"album as playlist": map[string]any{"playlist_uri": "spotify:album:37i9dQZF1DXcBWIGoYBM5M", "uris": []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}},
+		"no uris":           map[string]any{"playlist_uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "uris": []string{}},
+		"artist item":       map[string]any{"playlist_uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "uris": []string{"spotify:artist:4uLU6hMCjMI75M1A2tKUQC"}},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			ts := newTestServer(t, okReply)
+
+			resp := ts.do(http.MethodPost, "/library/playlists/add_tracks", payload)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			ts.requireNoRequest()
+		})
+	}
+
+	t.Run("maps a lasting conflict to 409", func(t *testing.T) {
+		ts := newTestServer(t, func(ApiRequest) (any, error) {
+			return nil, fmt.Errorf("failed appending to playlist: %w", spclient.ErrPlaylistConflict)
+		})
+
+		resp := ts.do(http.MethodPost, "/library/playlists/add_tracks", map[string]any{
+			"playlist_uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+			"uris":         []string{"spotify:track:4uLU6hMCjMI75M1A2tKUQC"},
+		})
+		require.Equal(t, http.StatusConflict, resp.StatusCode)
+	})
+}
+
 func TestApiSetDeviceName(t *testing.T) {
 	t.Run("forwards the name", func(t *testing.T) {
 		ts := newTestServer(t, okReply)
@@ -632,6 +794,57 @@ func TestApiWrappedErrorsMapToStatusCodes(t *testing.T) {
 
 	resp := ts.do(http.MethodGet, "/status", nil)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// A request nothing takes must be answered rather than park its handler.
+func TestApiUnreadRequestIsUnavailable(t *testing.T) {
+	old := requestPickupTimeout
+	requestPickupTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { requestPickupTimeout = old })
+
+	ts := newTestServer(t, nil)
+
+	resp := ts.do(http.MethodGet, "/status", nil)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// Without zeroconf nothing reads the requests until the login is done, so they
+// are answered as the zeroconf branch answers them without a session.
+func TestAnswerWithoutSession(t *testing.T) {
+	ts := newTestServer(t, nil)
+	app := &App{server: ts.server}
+
+	stop := app.answerWithoutSession(context.Background())
+
+	resp := ts.do(http.MethodGet, "/", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = ts.do(http.MethodGet, "/status", nil)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	resp = ts.do(http.MethodPost, "/set_device_name", ApiSetDeviceName{Name: "renamed"})
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not return")
+	}
+
+	// Once stopped, requests reach whoever reads next: the player, normally.
+	go func() {
+		req := <-ts.server.Receive()
+		req.Reply(&ApiStatus{Username: "someone"}, nil)
+	}()
+
+	resp = ts.do(http.MethodGet, "/status", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Contains(t, body(t, resp), "someone")
 }
 
 func TestApiUnknownPathIsNotFound(t *testing.T) {
