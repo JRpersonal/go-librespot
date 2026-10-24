@@ -842,18 +842,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 			Value: p.apiVolume(),
 		}, nil
 	case ApiRequestTypeSetVolume:
-		data := req.Data.(ApiSetVolume)
-
-		var volume int32
-		if data.Relative {
-			volume = int32(p.apiVolume())
-			volume += data.Volume
-			volume = max(min(volume, int32(p.app.cfg.VolumeSteps)), 0)
-		} else {
-			volume = data.Volume
-		}
-
-		p.updateVolume(uint32(volume) * player.MaxStateVolume / p.app.cfg.VolumeSteps)
+		p.updateVolume(p.app.volumeFromApi(req.Data.(ApiSetVolume), p.state.device.Volume))
 		return nil, nil
 	case ApiRequestTypeSetRepeatingContext:
 		val := req.Data.(bool)
@@ -888,7 +877,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 	case ApiRequestTypeLibraryPlaylists:
 		// Like the token, the rootlist touches no player state, so the loop
 		// does not wait on the playlist service for it.
-		data := req.Data.(ApiRequestDataLibraryPlaylists)
+		data := req.Data.(ApiRequestDataLibraryPage)
 		reply := apiReply(req)
 		spc, username := p.sess.Spclient(), p.sess.Username()
 		p.goDetached(libraryPlaylistsTimeout, func(ctx context.Context) {
@@ -899,6 +888,30 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 			}
 
 			reply.done(pageLibraryPlaylists(playlists, data.Offset, data.Limit), nil)
+		})
+
+		return nil, errReplyDeferred
+	case ApiRequestTypeLibraryAlbums, ApiRequestTypeLibraryArtists:
+		data := req.Data.(ApiRequestDataLibraryPage)
+		reply := apiReply(req)
+		spc, username, imageUrl := p.sess.Spclient(), p.sess.Username(), p.imageUrlFunc()
+		p.goDetached(libraryPlaylistsTimeout, func(ctx context.Context) {
+			if req.Type == ApiRequestTypeLibraryAlbums {
+				albums, err := fetchLibraryAlbums(ctx, spc, username, imageUrl, data.Offset, data.Limit)
+				if err != nil {
+					reply.done(nil, fmt.Errorf("failed listing saved albums: %w", err))
+					return
+				}
+				reply.done(albums, nil)
+				return
+			}
+
+			artists, err := fetchLibraryArtists(ctx, spc, username, imageUrl, data.Offset, data.Limit)
+			if err != nil {
+				reply.done(nil, fmt.Errorf("failed listing followed artists: %w", err))
+				return
+			}
+			reply.done(artists, nil)
 		})
 
 		return nil, errReplyDeferred
@@ -934,6 +947,36 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 			}
 
 			reply.done(&ApiLikedStates{Items: states}, nil)
+		})
+
+		return nil, errReplyDeferred
+	case ApiRequestTypePlaylistRemoveTrack:
+		data := req.Data.(ApiPlaylistRemoveTrack)
+		reply := apiReply(req)
+		spc, username := p.sess.Spclient(), p.sess.Username()
+		p.goDetached(libraryRequestTimeout, func(ctx context.Context) {
+			if err := removeFromPlaylist(ctx, spc, username, data.PlaylistUri, data.Uri, data.Position); err != nil {
+				reply.done(nil, libraryError("failed removing from playlist", err))
+				return
+			}
+
+			p.app.contextLists.invalidate(data.PlaylistUri)
+			reply.done(nil, nil)
+		})
+
+		return nil, errReplyDeferred
+	case ApiRequestTypePlaylistContains:
+		data := req.Data.(ApiRequestDataPlaylistContains)
+		reply := apiReply(req)
+		spc := p.sess.Spclient()
+		p.goDetached(libraryRequestTimeout, func(ctx context.Context) {
+			states, err := playlistContains(ctx, spc, data.PlaylistUri, data.Uris)
+			if err != nil {
+				reply.done(nil, libraryError("failed reading playlist", err))
+				return
+			}
+
+			reply.done(&ApiPlaylistContains{Items: states}, nil)
 		})
 
 		return nil, errReplyDeferred
