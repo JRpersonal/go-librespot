@@ -1,12 +1,14 @@
 package spclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -18,7 +20,8 @@ import (
 // collectionContentType is the media type the collection service speaks.
 const collectionContentType = "application/vnd.collection-v2.spotify.proto"
 
-// CollectionSetLikedSongs is the collection set holding the user's Liked Songs.
+// CollectionSetLikedSongs is the collection set holding the user's Liked Songs
+// and saved albums.
 const CollectionSetLikedSongs = "collection"
 
 // StatusError reports a status the collection or playlist service answered
@@ -32,6 +35,10 @@ type StatusError struct {
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("invalid status code from %s: %d", e.Op, e.StatusCode)
 }
+
+// CollectionSetArtists is the collection set holding the artists the user
+// follows.
+const CollectionSetArtists = "artist"
 
 // ErrPlaylistConflict reports that a playlist changed between reading its
 // revision and writing to it.
@@ -70,6 +77,46 @@ func (c *Spclient) CollectionWrite(ctx context.Context, username, set string, ur
 	}
 
 	return nil
+}
+
+// CollectionPage reads one page of a collection set; an empty token asks for
+// the first page. The response names the next page, empty on the last one.
+func (c *Spclient) CollectionPage(ctx context.Context, username, set, token string, limit int) (*collectionpb.PageResponse, error) {
+	body, err := proto.Marshal(&collectionpb.PageRequest{
+		Username:        username,
+		Set:             set,
+		PaginationToken: token,
+		Limit:           int32(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed marshalling PageRequest: %w", err)
+	}
+
+	resp, err := c.Request(ctx, "POST", "/collection/v2/paging", nil, http.Header{
+		"Content-Type": {collectionContentType},
+		"Accept":       {collectionContentType},
+	}, body)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("invalid status code from collection paging: %d", resp.StatusCode)
+	}
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading response body: %w", err)
+	}
+
+	var page collectionpb.PageResponse
+	if err := proto.Unmarshal(respBytes, &page); err != nil {
+		return nil, fmt.Errorf("failed unmarshalling PageResponse: %w", err)
+	}
+
+	return &page, nil
 }
 
 // CollectionContains tells for each of uris whether it is in one of the
@@ -123,6 +170,53 @@ func (c *Spclient) PlaylistRevision(ctx context.Context, playlist librespot.Spot
 	query.Set("from", "0")
 	query.Set("length", "1")
 
+	content, err := c.getPlaylist(ctx, playlist, query)
+	if err != nil {
+		return nil, err
+	}
+	return content.GetRevision(), nil
+}
+
+// playlistContentsPageSize is how many items PlaylistContents reads per page.
+const playlistContentsPageSize = 1000
+
+// playlistMaxPages caps the pages read for one playlist.
+const playlistMaxPages = 50
+
+// PlaylistContents returns a playlist's revision and its item URIs in order,
+// so items can be found by position. It reports ErrPlaylistConflict when the
+// playlist changes between two pages.
+func (c *Spclient) PlaylistContents(ctx context.Context, playlist librespot.SpotifyId) ([]byte, []string, error) {
+	var revision []byte
+	var uris []string
+	for page := 0; page < playlistMaxPages; page++ {
+		query := url.Values{}
+		query.Set("decorate", "revision")
+		query.Set("from", strconv.Itoa(len(uris)))
+		query.Set("length", strconv.Itoa(playlistContentsPageSize))
+
+		content, err := c.getPlaylist(ctx, playlist, query)
+		if err != nil {
+			return nil, nil, err
+		}
+		if page == 0 {
+			revision = content.GetRevision()
+		} else if !bytes.Equal(revision, content.GetRevision()) {
+			return nil, nil, ErrPlaylistConflict
+		}
+
+		items := content.GetContents().GetItems()
+		for _, item := range items {
+			uris = append(uris, item.GetUri())
+		}
+		if !content.GetContents().GetTruncated() || len(items) == 0 {
+			return revision, uris, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("playlist still truncated after %d pages", playlistMaxPages)
+}
+
+func (c *Spclient) getPlaylist(ctx context.Context, playlist librespot.SpotifyId, query url.Values) (*playlist4pb.SelectedListContent, error) {
 	resp, err := c.Request(ctx, "GET", fmt.Sprintf("/playlist/v2/playlist/%s", playlist.Base62()), query, nil, nil)
 	if err != nil {
 		return nil, err
@@ -143,8 +237,24 @@ func (c *Spclient) PlaylistRevision(ctx context.Context, playlist librespot.Spot
 	if err := proto.Unmarshal(respBytes, &content); err != nil {
 		return nil, fmt.Errorf("failed unmarshalling SelectedListContent: %w", err)
 	}
+	return &content, nil
+}
 
-	return content.GetRevision(), nil
+// PlaylistRemove removes the one item at position, which must be uri, as a
+// change based on revision. It returns ErrPlaylistConflict when the playlist
+// moved on since.
+//
+// The removal is by index range. Rem.items_as_key would make the items the
+// key instead and remove every entry of uri, duplicates included.
+func (c *Spclient) PlaylistRemove(ctx context.Context, playlist librespot.SpotifyId, username string, revision []byte, uri string, position int) error {
+	return c.playlistChange(ctx, playlist, username, revision, &playlist4pb.Op{
+		Kind: playlist4pb.Op_REM.Enum(),
+		Rem: &playlist4pb.Rem{
+			FromIndex: proto.Int32(int32(position)),
+			Length:    proto.Int32(1),
+			Items:     []*playlist4pb.Item{{Uri: proto.String(uri)}},
+		},
+	})
 }
 
 // PlaylistAppend appends uris to the end of a playlist, as a change based on
@@ -155,13 +265,19 @@ func (c *Spclient) PlaylistAppend(ctx context.Context, playlist librespot.Spotif
 		items = append(items, &playlist4pb.Item{Uri: proto.String(uri)})
 	}
 
+	return c.playlistChange(ctx, playlist, username, revision, &playlist4pb.Op{
+		Kind: playlist4pb.Op_ADD.Enum(),
+		Add:  &playlist4pb.Add{Items: items, AddLast: proto.Bool(true)},
+	})
+}
+
+// playlistChange sends one operation as a change to a playlist based on
+// revision.
+func (c *Spclient) playlistChange(ctx context.Context, playlist librespot.SpotifyId, username string, revision []byte, op *playlist4pb.Op) error {
 	body, err := proto.Marshal(&playlist4pb.ListChanges{
 		BaseRevision: revision,
 		Deltas: []*playlist4pb.Delta{{
-			Ops: []*playlist4pb.Op{{
-				Kind: playlist4pb.Op_ADD.Enum(),
-				Add:  &playlist4pb.Add{Items: items, AddLast: proto.Bool(true)},
-			}},
+			Ops: []*playlist4pb.Op{op},
 			Info: &playlist4pb.ChangeInfo{
 				User:      proto.String(username),
 				Timestamp: proto.Int64(time.Now().UnixMilli()),

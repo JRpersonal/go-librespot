@@ -135,9 +135,13 @@ const (
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
 	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
 	ApiRequestTypeLibraryPlaylists    ApiRequestType = "library_playlists"
+	ApiRequestTypeLibraryAlbums       ApiRequestType = "library_albums"
+	ApiRequestTypeLibraryArtists      ApiRequestType = "library_artists"
 	ApiRequestTypeSetLiked            ApiRequestType = "set_liked"
 	ApiRequestTypeGetLiked            ApiRequestType = "get_liked"
 	ApiRequestTypePlaylistAddTracks   ApiRequestType = "playlist_add_tracks"
+	ApiRequestTypePlaylistRemoveTrack ApiRequestType = "playlist_remove_track"
+	ApiRequestTypePlaylistContains    ApiRequestType = "playlist_contains"
 )
 
 // ApiRequestDataContextTracks carries the uri query parameter of the context
@@ -146,9 +150,9 @@ type ApiRequestDataContextTracks struct {
 	Uri string
 }
 
-// ApiRequestDataLibraryPlaylists carries the paging query parameters of the
-// library playlists request.
-type ApiRequestDataLibraryPlaylists struct {
+// ApiRequestDataLibraryPage carries the paging query parameters of the
+// library listing requests.
+type ApiRequestDataLibraryPage struct {
 	Offset int
 	Limit  int
 }
@@ -559,18 +563,31 @@ const (
 	libraryPlaylistsMaxLimit     = 500
 )
 
-func (s *ConcreteApiServer) GetLibraryPlaylists(w http.ResponseWriter, r *http.Request, params GetLibraryPlaylistsParams) {
+// handleLibraryPage validates the paging of a library listing and forwards it.
+func (s *ConcreteApiServer) handleLibraryPage(w http.ResponseWriter, r *http.Request, typ ApiRequestType, offset, limit int) {
 	// The generated params cannot tell an absent limit from limit=0.
 	if !r.URL.Query().Has("limit") {
-		params.Limit = libraryPlaylistsDefaultLimit
+		limit = libraryPlaylistsDefaultLimit
 	}
 
-	if params.Offset < 0 || params.Limit < 1 || params.Limit > libraryPlaylistsMaxLimit {
+	if offset < 0 || limit < 1 || limit > libraryPlaylistsMaxLimit {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibraryPlaylists, Data: ApiRequestDataLibraryPlaylists{Offset: params.Offset, Limit: params.Limit}}, w)
+	s.handleRequest(ApiRequest{Type: typ, Data: ApiRequestDataLibraryPage{Offset: offset, Limit: limit}}, w)
+}
+
+func (s *ConcreteApiServer) GetLibraryPlaylists(w http.ResponseWriter, r *http.Request, params GetLibraryPlaylistsParams) {
+	s.handleLibraryPage(w, r, ApiRequestTypeLibraryPlaylists, params.Offset, params.Limit)
+}
+
+func (s *ConcreteApiServer) GetLibraryAlbums(w http.ResponseWriter, r *http.Request, params GetLibraryAlbumsParams) {
+	s.handleLibraryPage(w, r, ApiRequestTypeLibraryAlbums, params.Offset, params.Limit)
+}
+
+func (s *ConcreteApiServer) GetLibraryArtists(w http.ResponseWriter, r *http.Request, params GetLibraryArtistsParams) {
+	s.handleLibraryPage(w, r, ApiRequestTypeLibraryArtists, params.Offset, params.Limit)
 }
 
 // maxLibraryUris caps how many items one library request may name.
@@ -624,12 +641,47 @@ func (s *ConcreteApiServer) PlaylistAddTracks(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if id, err := librespot.SpotifyIdFromUri(data.PlaylistUri); err != nil || id.Type() != librespot.SpotifyIdTypePlaylist {
+	if !validPlaylistUri(data.PlaylistUri) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistAddTracks, Data: data}, w)
+}
+
+// validPlaylistUri reports whether uri names a playlist.
+func validPlaylistUri(uri string) bool {
+	id, err := librespot.SpotifyIdFromUri(uri)
+	return err == nil && id.Type() == librespot.SpotifyIdTypePlaylist
+}
+
+func (s *ConcreteApiServer) PlaylistRemoveTrack(w http.ResponseWriter, r *http.Request) {
+	var data ApiPlaylistRemoveTrack
+	if err := jsonDecode(r, &data); err != nil ||
+		!validPlaylistUri(data.PlaylistUri) ||
+		!validItemUris([]string{data.Uri}, librespot.SpotifyIdTypeTrack, librespot.SpotifyIdTypeEpisode) ||
+		(data.Position != nil && *data.Position < 0) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistRemoveTrack, Data: data}, w)
+}
+
+// ApiRequestDataPlaylistContains carries the query of a contains request.
+type ApiRequestDataPlaylistContains struct {
+	PlaylistUri string
+	Uris        []string
+}
+
+func (s *ConcreteApiServer) PlaylistContains(w http.ResponseWriter, _ *http.Request, params PlaylistContainsParams) {
+	if !validPlaylistUri(params.PlaylistUri) ||
+		!validItemUris(params.Uris, librespot.SpotifyIdTypeTrack, librespot.SpotifyIdTypeEpisode) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistContains, Data: ApiRequestDataPlaylistContains{PlaylistUri: params.PlaylistUri, Uris: params.Uris}}, w)
 }
 
 func (s *ConcreteApiServer) PlayerResume(w http.ResponseWriter, _ *http.Request) {
