@@ -142,6 +142,14 @@ components:
         username:
           description: Currently active account's username
           type: string
+        product_type:
+          description: >-
+            The active account's product type as reported by the access point
+            in the ProductInfo packet at login, for example "premium" or
+            "free". Belongs to the account in username. Absent until the
+            access point has sent it.
+          type: string
+          x-omitempty: true
         device_id:
           description: The player device ID
           type: string
