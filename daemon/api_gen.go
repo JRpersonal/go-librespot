@@ -335,6 +335,9 @@ type ApiStatus struct {
 	// PlayOriginDeviceId The device ID that sent the command starting the playback, null when the playback was started locally through this API
 	PlayOriginDeviceId *string `json:"play_origin_device_id"`
 
+	// ProductType The active account's product type as reported by the access point in the ProductInfo packet at login, for example "premium" or "free". Belongs to the account in username. Absent until the access point has sent it.
+	ProductType *string `json:"product_type,omitempty"`
+
 	// RepeatContext Whether the repeat context feature is enabled
 	RepeatContext bool `json:"repeat_context"`
 

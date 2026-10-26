@@ -27,3 +27,20 @@ func (pi ProductInfo) ImageUrl(fileId []byte) *string {
 	val := strings.Replace(pi.Products[0].ImageUrl, "{file_id}", fileIdHex, 1)
 	return &val
 }
+
+// productType returns the account's product type ("premium", "free", ...)
+// from the access point's ProductInfo packet, or nil while it is unknown.
+// The packet arrives shortly after login, so a status read before it sees
+// nil rather than a guess. The ProductInfo lives on the AppPlayer, which is
+// created per session, so the value always belongs to that session's account.
+func productType(pi *ProductInfo) *string {
+	if pi == nil || len(pi.Products) == 0 {
+		return nil
+	}
+
+	val := strings.ToLower(strings.TrimSpace(pi.Products[0].Type))
+	if val == "" {
+		return nil
+	}
+	return &val
+}

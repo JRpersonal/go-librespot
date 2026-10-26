@@ -680,6 +680,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 	case ApiRequestTypeStatus:
 		resp := &ApiStatus{
 			Username:           p.sess.Username(),
+			ProductType:        productType(p.prodInfo),
 			DeviceId:           p.app.deviceId,
 			DeviceType:         p.app.deviceType.String(),
 			DeviceName:         p.app.cfg.DeviceName,

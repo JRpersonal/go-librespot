@@ -58,6 +58,14 @@ Candidates for upstreaming; kept as focused commits:
   callback is registered, because that path re-reads the whole file to fill the
   audio cache.
 
+## API additions
+
+- `GET /status` carries `product_type` ("premium", "free", ...), taken from
+  the ProductInfo packet the access point sends at login. It is absent until
+  that packet has arrived. The value lives on the per-session player, so it
+  always belongs to the account in `username`. STR reads it instead of the
+  Web API `GET /v1/me`, which answers 429/503 for long stretches.
+
 ## Merging upstream: what has to be checked by hand
 
 The passthrough work is spread across files upstream also changes, and a clean
