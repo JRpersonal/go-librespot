@@ -78,6 +78,15 @@ func (s *FileStateStore) Save(state *librespot.AppState) error {
 		return fmt.Errorf("failed writing marshalled app state: %w", err)
 	}
 
+	// Flush the data before the rename: on flash filesystems (UBIFS, JFFS2) the
+	// rename can otherwise reach the disk first, and a power cut in between
+	// leaves an empty or truncated state file that fails to load on every start.
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed syncing temporary app state file: %w", err)
+	}
+
 	// Windows cannot rename a file that still has an open handle.
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmpPath)
