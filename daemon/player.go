@@ -153,6 +153,10 @@ type AppPlayer struct {
 	// of refused tracks (even at the very start of a context) advances to the first playable
 	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
 	consecutiveUnplayableSkips int
+
+	// keyDenial counts audio-key refusals in a row and holds back new loads
+	// after a run of them, see key_denial.go.
+	keyDenial keyDenialState
 }
 
 // requestLogout hands this player back to the daemon to be torn down. With
