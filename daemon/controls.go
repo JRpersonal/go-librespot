@@ -770,6 +770,11 @@ func (p *AppPlayer) loadCurrentTrackOrSkip(paused, drop, resume bool, then func(
 			return
 		}
 
+		if p.keyDenialStreakReached() {
+			then(p.abortOnKeyDenials(uri, err, time.Now()))
+			return
+		}
+
 		p.app.log.WithError(err).Warnf("current track unplayable, skipping forward: %s", uri)
 		p.advanceNext(true, drop, 0, func(_ bool, err error) {
 			if err != nil {
@@ -790,6 +795,15 @@ func (p *AppPlayer) loadCurrentTrackOrSkip(paused, drop, resume bool, then func(
 // fetch can be cancelled, and a burst of those is what gets the daemon rate
 // limited.
 func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Duration, then func(error)) {
+	// Spotify just refused the audio key for track after track: asking again
+	// right away only feeds its throttle, see key_denial.go.
+	if err := p.keyDenialHeldBack(time.Now()); err != nil {
+		p.app.log.WithError(err).Warnf("not loading %s", p.state.player.Track.GetUri())
+		p.emitPlaybackError(playbackErrorStageSession, p.state.player.Track.GetUri(), err)
+		then(err)
+		return
+	}
+
 	if p.primaryStream != nil {
 		unloadPosition := p.player.PositionMs()
 		p.sess.Events().OnPrimaryStreamUnload(p.primaryStream, unloadPosition)
@@ -903,6 +917,7 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
 				return loaderResult{
 					err: err,
 					commit: func(p *AppPlayer, err error) {
+						p.noteLoadResult(err)
 						p.emitPlaybackError(playbackErrorStageLoad, spotId.Uri(), err)
 						then(err)
 					},
@@ -926,6 +941,7 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
 					}
 				},
 				commit: func(p *AppPlayer, err error) {
+					p.noteLoadResult(nil)
 					p.forgetReplacedStreamEvents(streamGen)
 					p.commitLoad(stream, spotId.Uri(), paused, position, prefetchedStream != nil)
 					then(err)
@@ -1569,6 +1585,13 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
 		}
 
 		var keyErr *audio.KeyProviderError
+		if errors.As(err, &keyErr) && p.keyDenialStreakReached() {
+			// Not this track: the session. Skipping on would only walk the
+			// rest of the context, one more key request per track.
+			then(false, p.abortOnKeyDenials(uri, err, time.Now()))
+			return
+		}
+
 		if errors.As(err, &keyErr) {
 			p.app.log.WithError(err).Warnf("skipping track: Spotify refused the audio key (code %d) for this playback context: %s", keyErr.Code, uri)
 		} else {

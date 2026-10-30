@@ -50,9 +50,12 @@ The websocket endpoint is available at `/events`. The following events are emitt
     - `uri`: The track URI
     - `play_origin`: Who started the playback
     - `stage`: Where it failed: `load` (the track could not be loaded), `playback` (the output failed mid-track; a
-      `stopped` event follows) or `session` (the connection to Spotify was lost for good)
-    - `kind`: What kind of failure it was: `restricted`, `unsupported`, `rate_limited`, `rejected`, `server`,
-      `timeout`, `network` or `unknown`
+      `stopped` event follows) or `session` (the connection to Spotify was lost for good, or Spotify refused the
+      audio key for several tracks in a row)
+    - `kind`: What kind of failure it was: `restricted`, `unsupported`, `key_denied`, `rate_limited`, `rejected`,
+      `server`, `timeout`, `network` or `unknown`. `key_denied` (stage `session`) means Spotify refused the audio
+      key for 3 tracks in a row: playback stops instead of skipping through the rest of the context, and new loads
+      are refused with the same kind for a back-off (30 s, doubling up to 5 min, cleared once a track plays)
     - `unplayable`: Whether the track itself cannot be played (restricted, in no supported format, or its audio key
       was refused). The player skips such a track when it can, so playback may carry on
     - `message`: The error, for a human to read

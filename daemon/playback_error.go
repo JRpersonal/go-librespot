@@ -24,6 +24,7 @@ const (
 // matching error text.
 const (
 	playbackErrorKindRestricted  = "restricted"
+	playbackErrorKindKeyDenied   = "key_denied"
 	playbackErrorKindUnsupported = "unsupported"
 	playbackErrorKindRateLimited = "rate_limited"
 	playbackErrorKindRejected    = "rejected"
@@ -42,6 +43,8 @@ func classifyPlaybackError(err error) string {
 	var netErr net.Error
 
 	switch {
+	case errors.Is(err, ErrAudioKeyDenied):
+		return playbackErrorKindKeyDenied
 	case errors.Is(err, librespot.ErrMediaRestricted), errors.As(err, &keyErr):
 		return playbackErrorKindRestricted
 	case errors.Is(err, librespot.ErrNoSupportedFormats):
