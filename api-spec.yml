@@ -512,13 +512,22 @@ components:
       x-go-name: ApiRoot
       description: API reachability and playback readiness
       type: object
-      required: [ playback_ready ]
+      required: [ playback_ready, features ]
       properties:
         playback_ready:
           description: >-
             Whether the daemon is fully bootstrapped and ready to accept
             /player/play
           type: boolean
+        features:
+          description: >-
+            Optional API behaviour this build supports, so a client can tell
+            it apart from an older build that would ignore the request.
+            Answered with or without a session. "play_shuffle_context":
+            /player/play takes shuffle_context.
+          type: array
+          items:
+            type: string
     volume:
       x-go-name: ApiVolume
       description: The player volume settings
@@ -584,6 +593,13 @@ components:
           type: integer
           format: int64
           x-go-type-skip-optional-pointer: true
+        shuffle_context:
+          description: >-
+            Whether to shuffle the context, applied before it loads: true
+            starts on a random track (unless skip_to_uri names one), false
+            starts in order. Absent keeps the current setting. A context that
+            does not allow shuffling plays in order either way.
+          type: boolean
     next:
       x-go-name: ApiNext
       description: A skip to next payload
@@ -1074,10 +1090,9 @@ paths:
       operationId: playerPlay
       description: >-
         Starts playing new content. To start a context shuffled (on a random
-        track), enable shuffle first via /player/shuffle_context and then call
-        this. Calling /player/shuffle_context after play only shuffles the
-        upcoming queue and keeps the current (first) track, so play alone (or
-        shuffle after play) always begins on the context's first track.
+        track), pass shuffle_context: true. Calling /player/shuffle_context
+        after play only shuffles the upcoming queue and keeps the current
+        (first) track.
       requestBody:
         required: true
         content:
@@ -1229,9 +1244,10 @@ paths:
     post:
       operationId: playerShuffleContext
       description: >-
-        Toggle shuffling the context. Enabling it BEFORE /player/play makes
-        playback start on a random track; enabling it after play only reshuffles
-        the upcoming queue and keeps the current (first) track.
+        Toggle shuffling the context. It applies only while a context is
+        loaded, and then reshuffles the upcoming queue and keeps the current
+        track. To start a context on a random track, pass shuffle_context to
+        /player/play instead.
       requestBody:
         required: true
         content:

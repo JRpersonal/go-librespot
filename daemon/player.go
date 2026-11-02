@@ -62,6 +62,10 @@ type AppPlayer struct {
 	// network here.
 	resolveTrackList func(ctx context.Context, spotCtx *connectpb.Context) (*tracks.List, error)
 
+	// resolvePlayContext resolves the uri a /player/play asks for. Nil means
+	// the real one, over the session's spclient.
+	resolvePlayContext func(ctx context.Context, uri string) (*connectpb.Context, error)
+
 	// loadGen stamps track and context work, prefetchGen what is fetched ahead
 	// for the transition after it. They are separate because a queue edit or
 	// an option change makes whatever was prefetched wrong without making the
@@ -346,6 +350,15 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
 	}
 
 	return tracks.NewTrackListFromContext(ctx, p.app.log, p.sess.Spclient(), spotCtx)
+}
+
+// contextForPlay resolves the context a /player/play asks for.
+func (p *AppPlayer) contextForPlay(ctx context.Context, uri string) (*connectpb.Context, error) {
+	if p.resolvePlayContext != nil {
+		return p.resolvePlayContext(ctx, uri)
+	}
+
+	return p.sess.Spclient().ContextResolve(ctx, uri)
 }
 
 // applyTransferSession takes over what a transfer says about the session it
@@ -680,7 +693,7 @@ func nonEmpty(s string) *string {
 func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 	switch req.Type {
 	case ApiRequestTypeRoot:
-		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
+		return newApiRoot(p.playbackReady()), nil
 	case ApiRequestTypeStatus:
 		resp := &ApiStatus{
 			Username:           p.sess.Username(),
@@ -799,7 +812,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 			gen:   p.loadGen,
 			reply: apiReply(req),
 			run: func(ctx context.Context) loaderResult {
-				spotCtx, err := p.sess.Spclient().ContextResolve(ctx, data.Uri)
+				spotCtx, err := p.contextForPlay(ctx, data.Uri)
 				if err != nil {
 					return loaderResult{err: fmt.Errorf("failed resolving context: %w", err)}
 				}
@@ -815,6 +828,13 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 					p.state.player.PlayOrigin = &connectpb.PlayOrigin{
 						FeatureIdentifier: "go-librespot",
 						FeatureVersion:    librespot.VersionNumberString(),
+					}
+
+					// Applied here, once this play is the one that goes ahead:
+					// a play superseded before its context resolved leaves the
+					// setting alone.
+					if data.ShuffleContext != nil {
+						p.setLoadShuffle(spotCtx, *data.ShuffleContext)
 					}
 
 					p.loadContext(spotCtx, skipTo, loadPaused, true, func(err error) {

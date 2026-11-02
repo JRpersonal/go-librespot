@@ -331,6 +331,35 @@ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
 
 type skipToFunc func(*connectpb.ContextTrack) bool
 
+// setLoadShuffle sets the shuffle option for a context that is about to be
+// loaded, as /player/play's shuffle_context asks. loadContext reads it and
+// shuffles the new list before picking where to start, so a shuffled play
+// starts on a random track with a single load.
+//
+// Unlike setOptions it reorders nothing: the list setOptions would walk is
+// the one being replaced. Setting shuffle through /player/shuffle_context
+// just before a play started that walk on the old list, held the play's load
+// up behind it, and only took effect at all while a context was loaded.
+func (p *AppPlayer) setLoadShuffle(spotCtx *connectpb.Context, shuffle bool) {
+	// The same rule loadContext applies: a context that does not allow
+	// shuffling plays in order.
+	if shuffle && len(spotCtx.GetRestrictions().GetDisallowTogglingShuffleReasons()) > 0 {
+		shuffle = false
+	}
+
+	if p.state.player.Options.ShufflingContext == shuffle {
+		return
+	}
+
+	p.state.player.Options.ShufflingContext = shuffle
+	p.app.server.Emit(&ApiEvent{
+		Type: ApiEventTypeShuffleContext,
+		Data: ApiEventDataShuffleContext{
+			Value: shuffle,
+		},
+	})
+}
+
 // loadContext starts playing a context. The state that describes it is claimed
 // here, so controllers see the new context immediately; resolving the context
 // and walking it to the starting track runs on the loader lane, and the track

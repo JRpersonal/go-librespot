@@ -203,6 +203,9 @@ type ApiPlay struct {
 	// Position Position in milliseconds to start playback at within the selected track (0 starts from the beginning)
 	Position int64 `json:"position,omitempty"`
 
+	// ShuffleContext Whether to shuffle the context, applied before it loads: true starts on a random track (unless skip_to_uri names one), false starts in order. Absent keeps the current setting. A context that does not allow shuffling plays in order either way.
+	ShuffleContext *bool `json:"shuffle_context,omitempty"`
+
 	// SkipToUri Spotify URI to skip to (when playing playlists)
 	SkipToUri string `json:"skip_to_uri,omitempty"`
 
@@ -260,6 +263,9 @@ type ApiRepeatTrack struct {
 
 // ApiRoot API reachability and playback readiness
 type ApiRoot struct {
+	// Features Optional API behaviour this build supports, so a client can tell it apart from an older build that would ignore the request. Answered with or without a session. "play_shuffle_context": /player/play takes shuffle_context.
+	Features []string `json:"features"`
+
 	// PlaybackReady Whether the daemon is fully bootstrapped and ready to accept /player/play
 	PlaybackReady bool `json:"playback_ready"`
 }

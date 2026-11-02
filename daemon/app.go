@@ -483,7 +483,7 @@ func (app *App) answerWithoutSession(ctx context.Context) (stop func()) {
 			case req := <-app.server.Receive():
 				switch req.Type {
 				case ApiRequestTypeRoot:
-					req.Reply(&ApiRoot{}, nil)
+					req.Reply(newApiRoot(false), nil)
 				case ApiRequestTypeGetVolume:
 					req.Reply(app.volumeWithoutSession(), nil)
 				case ApiRequestTypeSetVolume:
@@ -643,7 +643,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
 				if sess == nil {
 					switch req.Type {
 					case ApiRequestTypeRoot:
-						req.Reply(&ApiRoot{}, nil)
+						req.Reply(newApiRoot(false), nil)
 					case ApiRequestTypeGetVolume:
 						req.Reply(app.volumeWithoutSession(), nil)
 					case ApiRequestTypeSetVolume:

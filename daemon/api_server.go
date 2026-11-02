@@ -111,6 +111,20 @@ var (
 	ErrTooManyRequests  = errors.New("the app has exceeded its rate limits")
 )
 
+// ApiFeaturePlayShuffleContext reports that /player/play takes shuffle_context.
+// An older build decodes the field away silently, so a client that relies on
+// it looks for this first.
+const ApiFeaturePlayShuffleContext = "play_shuffle_context"
+
+// apiFeatures lists the optional API behaviour this build supports.
+var apiFeatures = []string{ApiFeaturePlayShuffleContext}
+
+// newApiRoot answers GET /. It is answered with or without a session, so the
+// features are there for a client to read before anything plays.
+func newApiRoot(playbackReady bool) *ApiRoot {
+	return &ApiRoot{PlaybackReady: playbackReady, Features: apiFeatures}
+}
+
 type ApiRequestType string
 
 const (
