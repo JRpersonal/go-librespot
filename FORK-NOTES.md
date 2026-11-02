@@ -65,6 +65,18 @@ Candidates for upstreaming; kept as focused commits:
   that packet has arrived. The value lives on the per-session player, so it
   always belongs to the account in `username`. STR reads it instead of the
   Web API `GET /v1/me`, which answers 429/503 for long stretches.
+- `POST /player/play` takes an optional `shuffle_context`. It sets the shuffle
+  option before the context loads, so `true` starts on a random track with a
+  single load and `false` starts in order whatever an earlier play left on.
+  Absent keeps the current setting, as before. Setting shuffle through
+  `/player/shuffle_context` first does not do this: that endpoint only acts on
+  a loaded context, and it starts a reorder walk of the OLD list that the play
+  then has to wait for. STR loaded paused, toggled shuffle and skipped once,
+  which showed the playlist's first song in the Spotify app before the pick.
+- `GET /` carries `features`, the optional API behaviour this build supports
+  (`play_shuffle_context` for the above), answered with or without a session.
+  An older build decodes unknown request fields away silently, so a client
+  checks this before relying on one.
 
 ## Merging upstream: what has to be checked by hand
 

@@ -181,13 +181,13 @@ func TestApiRejectsWrongMethod(t *testing.T) {
 
 func TestApiRoot(t *testing.T) {
 	ts := newTestServer(t, func(ApiRequest) (any, error) {
-		return &ApiRoot{PlaybackReady: true}, nil
+		return newApiRoot(true), nil
 	})
 
 	resp := ts.do(http.MethodGet, "/", nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
-	require.JSONEq(t, `{"playback_ready":true}`, body(t, resp))
+	require.JSONEq(t, `{"playback_ready":true,"features":["play_shuffle_context"]}`, body(t, resp))
 
 	require.Equal(t, ApiRequestTypeRoot, ts.request().Type)
 }
@@ -416,6 +416,25 @@ func TestApiPlay(t *testing.T) {
 
 		ts.do(http.MethodPost, "/player/play", map[string]any{"uri": "spotify:track:xxx"})
 		require.EqualValues(t, 0, ts.request().Data.(ApiPlay).Position)
+	})
+
+	t.Run("shuffle_context is passed on only when given", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			payload map[string]any
+			want    *bool
+		}{
+			"on":     {map[string]any{"uri": "spotify:playlist:xxx", "shuffle_context": true}, boolPtr(true)},
+			"off":    {map[string]any{"uri": "spotify:playlist:xxx", "shuffle_context": false}, boolPtr(false)},
+			"absent": {map[string]any{"uri": "spotify:playlist:xxx"}, nil},
+		} {
+			t.Run(name, func(t *testing.T) {
+				ts := newTestServer(t, okReply)
+
+				resp := ts.do(http.MethodPost, "/player/play", tc.payload)
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				require.Equal(t, tc.want, ts.request().Data.(ApiPlay).ShuffleContext)
+			})
+		}
 	})
 
 	for name, payload := range map[string]any{
