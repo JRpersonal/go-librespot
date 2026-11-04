@@ -57,6 +57,16 @@ Candidates for upstreaming; kept as focused commits:
   released chunk is re-downloaded transparently. Disabled while an OnComplete
   callback is registered, because that path re-reads the whole file to fill the
   audio cache.
+- audio: audio key requests go out one at a time, at least 200 ms apart, and
+  after Spotify refuses one the whole session waits 3, then 5, then 10 s before
+  it asks for any key; a key that arrives resets the wait, a timeout does not
+  start one. A refused key is asked for again after each wait, up to three
+  times, so a passing run of refusals (librespot-org/librespot#1649, the
+  back-off of librespot-org/librespot#1844) ends in a played track. Once a run
+  has outlasted its retries, further keys of that run are asked for once, so a
+  lasting refusal still reaches the three-in-a-row stop in `daemon/key_denial.go`
+  in about 40 s rather than several minutes. A prefetch asks once and not at all
+  during a wait.
 
 ## API additions
 
