@@ -19,6 +19,12 @@ import (
 //
 // So a streak of refusals is treated as a session-level failure: playback stops,
 // one clear playback_error goes out, and new loads are held back for a while.
+//
+// Below this, audio.KeyProvider paces the key requests themselves: after a
+// refusal it waits 3, 5, then 10 s before asking for any key and asks again for
+// the refused one, so a passing run of refusals ends in a played track instead
+// of a skip. A refusal counted here has therefore already outlasted those
+// waits, and the walk to the next track waits them out too instead of bursting.
 const (
 	// maxConsecutiveKeyDenials is how many audio-key refusals in a row end the
 	// walk. Only consecutive refusals count: a successful load resets the

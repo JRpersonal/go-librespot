@@ -90,6 +90,10 @@ func (p *AppPlayer) submitPrefetch(uri string, metadata map[string]string) {
 		class: classPrefetch,
 		gen:   p.prefetchGen,
 		run: func(ctx context.Context) loaderResult {
+			// A prefetch can do without the key: it asks once, and not at all
+			// while the session waits after a refused key, so it does not hold
+			// up the load that comes after it.
+			ctx = audio.WithSingleKeyAttempt(ctx)
 			stream, err := p.player.NewStream(ctx, p.app.client, *nextId, p.app.cfg.Bitrate, 0)
 			if err != nil {
 				return loaderResult{err: fmt.Errorf("failed prefetching %s stream: %w", nextId.Type(), err)}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -29,6 +30,10 @@ type KeyProvider struct {
 	recvLoopOnce sync.Once
 
 	reqChan chan keyRequest
+
+	// pacer spaces the requests out and backs off after a refusal, for the
+	// whole session.
+	pacer *keyPacer
 }
 
 type keyRequest struct {
@@ -45,6 +50,7 @@ type keyResponse struct {
 func NewAudioKeyProvider(log librespot.Logger, ap *ap.Accesspoint) *KeyProvider {
 	p := &KeyProvider{log: log, ap: ap}
 	p.reqChan = make(chan keyRequest)
+	p.pacer = newKeyPacer(log, defaultKeyPacerConfig)
 	return p
 }
 
@@ -123,7 +129,54 @@ func (p *KeyProvider) recvLoop() {
 	}
 }
 
+// Request asks Spotify for the AES key of fileId. Requests go out one at a
+// time, at least 200 ms apart. After a refusal the session waits 3, then 5,
+// then 10 seconds before it asks for any key, and a refused key is asked for
+// again after each wait, up to three times, before the refusal
+// (*KeyProviderError) is returned. A ctx marked with WithSingleKeyAttempt asks
+// once and fails with ErrKeyBackingOff during a wait. The waits end with ctx.
 func (p *KeyProvider) Request(ctx context.Context, gid []byte, fileId []byte) ([]byte, error) {
+	done := p.ap.Done()
+	select {
+	case <-done:
+		return nil, ap.ErrAccesspointClosed
+	default:
+	}
+
+	// A closed accesspoint ends any wait too.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	send := func(ctx context.Context) ([]byte, error) { return p.requestNow(ctx, gid, fileId) }
+
+	var key []byte
+	var err error
+	if isSingleKeyAttempt(ctx) {
+		key, err = p.pacer.tryOnce(ctx, send)
+	} else {
+		key, err = p.pacer.request(ctx, send)
+	}
+
+	if errors.Is(err, context.Canceled) {
+		select {
+		case <-done:
+			return nil, ap.ErrAccesspointClosed
+		default:
+		}
+	}
+
+	return key, err
+}
+
+// requestNow sends one key request and waits for its answer.
+func (p *KeyProvider) requestNow(ctx context.Context, gid []byte, fileId []byte) ([]byte, error) {
 	done := p.ap.Done()
 
 	p.startReceiving()
