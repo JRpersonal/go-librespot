@@ -412,10 +412,46 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
 	return true
 }
 
+// remoteCommandLogLine renders the log line for an incoming remote player
+// command and reports whether it belongs at info level. Every command that
+// changes what the speaker plays (pause, resume, transfer, skip, sleep timer,
+// ...) is logged at info, so a pause in the log can be traced back to the
+// device that sent it. Commands Spotify clients send as a side effect of
+// browsing or of a Jam session (context metadata refreshes, queue syncs)
+// stay at debug to keep the info log readable. Only the sending device's
+// Connect device id is logged, never account names or tokens.
+func remoteCommandLogLine(req *dealer.RequestPayload) (string, bool) {
+	sentBy := req.SentByDeviceId
+	if sentBy == "" {
+		sentBy = "unknown"
+	}
+
+	endpoint := req.Command.Endpoint
+	switch endpoint {
+	case "update_context", "set_queue":
+		return fmt.Sprintf("remote command %s from device %s", endpoint, sentBy), false
+	case "set_sleep_timer":
+		timer := "clear"
+		if tt := req.Command.TimerType; tt != nil && tt.Type != "" {
+			timer = tt.Type
+			if tt.Type == "duration" {
+				timer = fmt.Sprintf("duration %ds", tt.DurationS)
+			}
+		}
+		return fmt.Sprintf("remote command %s (%s) from device %s", endpoint, timer, sentBy), true
+	default:
+		return fmt.Sprintf("remote command %s from device %s", endpoint, sentBy), true
+	}
+}
+
 func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
 	p.state.lastCommand = &req
 
-	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+	if line, info := remoteCommandLogLine(&req); info {
+		p.app.log.Info(line)
+	} else {
+		p.app.log.Debug(line)
+	}
 
 	switch req.Command.Endpoint {
 	case "transfer":
@@ -1258,6 +1294,7 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 			// up - so the app stops showing the timer as active in the same
 			// state push that reports playback paused.
 			p.state.player.SleepTimer = nil
+			p.app.log.Info("sleep timer ran out, pausing")
 			if err := p.pause(); err != nil {
 				p.app.log.WithError(err).Warn("failed pausing playback for sleep timer")
 			}

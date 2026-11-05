@@ -293,6 +293,7 @@ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
 		if p.sleepAtEndOfTrack {
 			p.sleepAtEndOfTrack = false
 			p.state.player.SleepTimer = nil
+			p.app.log.Info("sleep timer set to end of track: track ended, pausing")
 			if err := p.pause(); err != nil {
 				p.app.log.WithError(err).Warn("failed pausing playback for sleep timer")
 			}
