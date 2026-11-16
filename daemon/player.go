@@ -43,6 +43,11 @@ type AppPlayer struct {
 	app  *App
 	sess *session.Session
 
+	// cluster is the latest Spotify Connect cluster the service sent. Only the
+	// Run goroutine touches it.
+	cluster   *connectpb.Cluster
+	clusterAt time.Time
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -134,6 +139,10 @@ type AppPlayer struct {
 	// until a burst of skips has settled, so the burst costs one request.
 	metaPrefetchTimer *time.Timer
 
+	// lastQueue is the play order the last queue event announced. Run
+	// goroutine only.
+	lastQueue queueSignature
+
 	// lastFullMetaContext is the context uri the last full sweep ran for, so
 	// replaying the same playlist does not re-sweep it. Run goroutine only.
 	lastFullMetaContext string
@@ -220,6 +229,7 @@ func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byt
 		}
 
 		p.prodInfo = &prod
+		p.emitQueue()
 		return nil
 	case ap.PacketTypeCountryCode:
 		p.countryCode.Store(pointer(string(payload)))
@@ -266,12 +276,17 @@ func (p *AppPlayer) handleDealerMessage(msg dealer.Message) error {
 			return fmt.Errorf("failed unmarshalling ClusterUpdate: %w", err)
 		}
 
+		p.setCluster(clusterUpdate.Cluster)
+		if resp := p.connectDevices(time.Now()); resp != nil {
+			p.app.server.Emit(&ApiEvent{Type: ApiEventTypeCluster, Data: resp})
+		}
+
 		if !p.state.active {
 			p.state.lastClusterTimestamp = clusterUpdate.Cluster.GetPlayerState().GetTimestamp()
 		}
 
 		otherActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId
-		stopBeingActive := otherActive && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.activationTimestamp
+		stopBeingActive := otherActive && clusterUpdate.Cluster.GetPlayerState().GetTimestamp() > p.state.activationTimestamp
 
 		// We are still the active device, do not quit
 		if !stopBeingActive {
@@ -488,7 +503,7 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
 		//
 		// A context can arrive without a track in it, which would otherwise be
 		// dereferenced here; the loader then plays it from the top.
-		p.state.player.Track = nil
+		p.state.clearTrack()
 		if current := transferState.Playback.CurrentTrack; singleTrackContext(current) != nil {
 			contextSpotType := librespot.InferSpotifyIdTypeFromContext(transferState.CurrentSession.Context)
 			p.state.player.Track = librespot.ContextTrackToProvidedTrack(contextSpotType, current)
@@ -500,6 +515,7 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
 		p.state.player.IsBuffering = true
 		p.state.player.PlaybackSpeed = 0 // not progressing while buffering
 		p.flushState()
+		p.emitQueue()
 
 		p.app.server.Emit(&ApiEvent{
 			Type: ApiEventTypeActive,
@@ -722,6 +738,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 		resp.NextTrack = p.apiNextTrack()
 
 		return resp, nil
+	case ApiRequestTypeGetQueue:
+		return p.apiQueue(), nil
 	case ApiRequestTypeContextTracks:
 		if p.meta == nil {
 			return nil, ErrNotFound
@@ -739,6 +757,14 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 		p.scheduleContextEnumerate(data.Uri)
 
 		return p.contextTracksResponse(data.Uri, uris, ready), nil
+	case ApiRequestTypeConnectDevices:
+		resp := p.connectDevices(time.Now())
+		if resp == nil {
+			return nil, ErrNotFound
+		}
+		return resp, nil
+	case ApiRequestTypeConnectTransfer, ApiRequestTypeConnectCommand:
+		return p.handleConnectControl(req)
 	case ApiRequestTypeResume:
 		_ = p.play()
 		return nil, nil
@@ -768,7 +794,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 		_ = p.seek(position)
 		return nil, nil
 	case ApiRequestTypePrev:
-		_ = p.skipPrev(true)
+		data := req.Data.(ApiPrev)
+		_ = p.skipPrev(data.AllowSeeking == nil || *data.AllowSeeking)
 		return nil, nil
 	case ApiRequestTypeNext:
 		data := req.Data.(ApiNext)
@@ -1133,10 +1160,32 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 		return
 	}
 
-	apRecv := p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode)
-	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/")
-	reqRecv := p.sess.Dealer().ReceiveRequest("hm://connect-state/v1/player/command")
-	playerRecv := p.player.Receive()
+	p.serve(
+		p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode),
+		p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/"),
+		p.sess.Dealer().ReceiveRequest("hm://connect-state/v1/player/command"),
+		p.player.Receive(),
+		apiRecv, mprisRecv,
+	)
+}
+
+// serve is Run's loop, split out so that tests can drive it without a session.
+func (p *AppPlayer) serve(
+	apRecv <-chan ap.Packet,
+	msgRecv <-chan dealer.Message,
+	reqRecv <-chan dealer.Request,
+	playerRecv <-chan player.Event,
+	apiRecv <-chan ApiRequest,
+	mprisRecv <-chan mpris.MediaPlayer2PlayerCommand,
+) {
+	defer p.emitQueueGone()
+
+	// Metadata fetches run detached and cannot read the play order, so they
+	// wake the loop to do it. Nil, never ready, with metadata disabled.
+	var metaCached <-chan struct{}
+	if p.meta != nil {
+		metaCached = p.meta.cached
+	}
 
 	volumeTimer := time.NewTimer(time.Minute)
 	volumeTimer.Stop() // don't emit a volume change event at start
@@ -1253,6 +1302,8 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 			p.prefetchNext()
 		case <-p.metaPrefetchTimer.C:
 			p.prefetchWindowMetadata()
+		case <-metaCached:
+			p.emitQueue()
 		case <-p.sleepTimer.C:
 			// Cleared before pause(), whose own updateState call picks this
 			// up - so the app stops showing the timer as active in the same

@@ -148,6 +148,7 @@ const (
 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
 	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
+	ApiRequestTypeGetQueue            ApiRequestType = "get_queue"
 	ApiRequestTypeLibraryPlaylists    ApiRequestType = "library_playlists"
 	ApiRequestTypeLibraryAlbums       ApiRequestType = "library_albums"
 	ApiRequestTypeLibraryArtists      ApiRequestType = "library_artists"
@@ -156,6 +157,9 @@ const (
 	ApiRequestTypePlaylistAddTracks   ApiRequestType = "playlist_add_tracks"
 	ApiRequestTypePlaylistRemoveTrack ApiRequestType = "playlist_remove_track"
 	ApiRequestTypePlaylistContains    ApiRequestType = "playlist_contains"
+	ApiRequestTypeConnectDevices      ApiRequestType = "connect_devices"
+	ApiRequestTypeConnectTransfer     ApiRequestType = "connect_transfer"
+	ApiRequestTypeConnectCommand      ApiRequestType = "connect_command"
 )
 
 // ApiRequestDataContextTracks carries the uri query parameter of the context
@@ -189,6 +193,8 @@ const (
 	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
 	ApiEventTypePlaybackReady  ApiEventType = "playback_ready"
 	ApiEventTypePlaybackError  ApiEventType = "playback_error"
+	ApiEventTypeCluster        ApiEventType = "cluster"
+	ApiEventTypeQueue          ApiEventType = "queue"
 )
 
 type ApiRequest struct {
@@ -296,18 +302,22 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
 	return resp
 }
 
+// newApiResponseStatusMedia describes cached or playing media. Fields are read
+// through the getters, as the service may leave any of them out.
 func (p *AppPlayer) newApiResponseStatusMedia(media *librespot.Media, position int64) *ApiTrack {
 	if media.IsTrack() {
 		track := media.Track()
 
-		var artists []string
+		artists := make([]string, 0, len(track.Artist))
 		for _, a := range track.Artist {
-			artists = append(artists, *a.Name)
+			// A nameless artist's "" is kept: artist_uris pair with
+			// artist_names by index.
+			artists = append(artists, a.GetName())
 		}
 
-		albumCoverId := getBestImageIdForSize(track.Album.Cover, p.app.cfg.ImageSize)
-		if albumCoverId == nil && track.Album.CoverGroup != nil {
-			albumCoverId = getBestImageIdForSize(track.Album.CoverGroup.Image, p.app.cfg.ImageSize)
+		albumCoverId := getBestImageIdForSize(track.GetAlbum().GetCover(), p.app.cfg.ImageSize)
+		if albumCoverId == nil {
+			albumCoverId = getBestImageIdForSize(track.GetAlbum().GetCoverGroup().GetImage(), p.app.cfg.ImageSize)
 		}
 
 		artistUris := make([]string, 0, len(track.Artist))
@@ -316,39 +326,54 @@ func (p *AppPlayer) newApiResponseStatusMedia(media *librespot.Media, position i
 		}
 
 		return &ApiTrack{
-			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, track.Gid).Uri(),
-			Name:          *track.Name,
+			Uri:           gidUri(librespot.SpotifyIdTypeTrack, track.GetGid()),
+			Name:          track.GetName(),
 			ArtistNames:   artists,
 			ArtistUris:    artistUris,
-			AlbumName:     *track.Album.Name,
-			AlbumUri:      gidUri(librespot.SpotifyIdTypeAlbum, track.Album.GetGid()),
+			AlbumName:     track.GetAlbum().GetName(),
+			AlbumUri:      gidUri(librespot.SpotifyIdTypeAlbum, track.GetAlbum().GetGid()),
 			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
 			Position:      position,
-			Duration:      int(*track.Duration),
-			ReleaseDate:   track.Album.Date.String(),
-			TrackNumber:   int(*track.Number),
-			DiscNumber:    int(*track.DiscNumber),
+			Duration:      int(track.GetDuration()),
+			ReleaseDate:   releaseDate(track.GetAlbum().GetDate()),
+			TrackNumber:   int(track.GetNumber()),
+			DiscNumber:    int(track.GetDiscNumber()),
 		}
 	} else {
 		episode := media.Episode()
 
-		albumCoverId := getBestImageIdForSize(episode.CoverImage.Image, p.app.cfg.ImageSize)
+		albumCoverId := getBestImageIdForSize(episode.GetCoverImage().GetImage(), p.app.cfg.ImageSize)
+
+		// The show stands for the artist.
+		artists := []string{}
+		if show := episode.GetShow().GetName(); show != "" {
+			artists = append(artists, show)
+		}
 
 		return &ApiTrack{
-			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeEpisode, episode.Gid).Uri(),
-			Name:          *episode.Name,
-			ArtistNames:   []string{*episode.Show.Name},
+			Uri:           gidUri(librespot.SpotifyIdTypeEpisode, episode.GetGid()),
+			Name:          episode.GetName(),
+			ArtistNames:   artists,
 			ArtistUris:    []string{},
-			AlbumName:     *episode.Show.Name,
-			AlbumUri:      gidUri(librespot.SpotifyIdTypeShow, episode.Show.GetGid()),
+			AlbumName:     episode.GetShow().GetName(),
+			AlbumUri:      gidUri(librespot.SpotifyIdTypeShow, episode.GetShow().GetGid()),
 			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
 			Position:      position,
-			Duration:      int(*episode.Duration),
+			Duration:      int(episode.GetDuration()),
 			ReleaseDate:   "",
 			TrackNumber:   0,
 			DiscNumber:    0,
 		}
 	}
+}
+
+// releaseDate describes an album's date, or "" when the metadata has none
+// (the message's String would say "<nil>").
+func releaseDate(date *metadatapb.Date) string {
+	if date == nil {
+		return ""
+	}
+	return date.String()
 }
 
 // gidUri turns a metadata gid into a URI of the given type, or "" when the
@@ -507,6 +532,10 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 		case errors.Is(resp.err, ErrBadRequest):
 			w.WriteHeader(http.StatusBadRequest)
 			return
+		case errors.Is(resp.err, ErrRemote):
+			s.log.WithError(resp.err).Warnf("failed handling request %s", req.Type)
+			w.WriteHeader(http.StatusBadGateway)
+			return
 		default:
 			s.log.WithError(resp.err).Errorf("failed handling request %s", req.Type)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -548,6 +577,30 @@ func (s *ConcreteApiServer) GetRoot(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeRoot}, w)
 }
 
+func (s *ConcreteApiServer) GetConnectDevices(w http.ResponseWriter, _ *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectDevices}, w)
+}
+
+func (s *ConcreteApiServer) ConnectTransfer(w http.ResponseWriter, r *http.Request) {
+	var data ApiConnectTransfer
+	if err := jsonDecode(r, &data); err != nil || data.DeviceId == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectTransfer, Data: data}, w)
+}
+
+func (s *ConcreteApiServer) ConnectCommand(w http.ResponseWriter, r *http.Request) {
+	var data ApiConnectCommand
+	if err := jsonDecode(r, &data); err != nil || data.DeviceId == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeConnectCommand, Data: data}, w)
+}
+
 func (s *ConcreteApiServer) GetStatus(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
 }
@@ -565,6 +618,10 @@ func (s *ConcreteApiServer) GetAuthCode(w http.ResponseWriter, _ *http.Request) 
 
 func (s *ConcreteApiServer) GetToken(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+}
+
+func (s *ConcreteApiServer) PlayerGetQueue(w http.ResponseWriter, _ *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeGetQueue}, w)
 }
 
 func (s *ConcreteApiServer) GetContextTracks(w http.ResponseWriter, _ *http.Request, params GetContextTracksParams) {
@@ -714,8 +771,15 @@ func (s *ConcreteApiServer) PlayerStop(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeStop}, w)
 }
 
-func (s *ConcreteApiServer) PlayerPrev(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypePrev}, w)
+func (s *ConcreteApiServer) PlayerPrev(w http.ResponseWriter, r *http.Request) {
+	// The body used to be ignored: one that does not parse gets the default
+	// rather than a 400.
+	var data ApiPrev
+	if err := jsonDecode(r, &data); err != nil {
+		data = ApiPrev{}
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePrev, Data: data}, w)
 }
 
 func (s *ConcreteApiServer) PlayerGetVolume(w http.ResponseWriter, _ *http.Request) {

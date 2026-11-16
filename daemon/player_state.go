@@ -65,6 +65,15 @@ func (s *State) setPaused(val bool) {
 	}
 }
 
+// clearTrack forgets the current track together with its playback id. The
+// two travel as a pair: the official clients read the track through the
+// playback id, and a state that carries a playback id without a track makes
+// Spotify for Android crash (#434).
+func (s *State) clearTrack() {
+	s.player.Track = nil
+	s.player.PlaybackId = ""
+}
+
 func (s *State) setActive(val bool) {
 	if val {
 		if s.active {
@@ -223,6 +232,7 @@ func (p *AppPlayer) initState() {
 			Brand:                 "spotify",
 			Model:                 "go-librespot",
 			License:               "premium",
+			IsGroup:               p.app.cfg.DeviceIsGroup,
 			Capabilities: &connectpb.Capabilities{
 				CanBePlayer:                true,
 				RestrictToLocal:            false,
@@ -298,8 +308,10 @@ func (p *AppPlayer) publishUpcoming(snap *tracks.Snapshot) {
 	p.state.player.NextTracks = snap.Next
 
 	// Every path that moves the window — load, transfer, skip, queue edit,
-	// shuffle — lands here, so this is where its metadata is asked for.
+	// shuffle — lands here, so this is where its metadata is asked for and
+	// where the move is announced.
 	p.scheduleMetaPrefetch()
+	p.emitQueue()
 }
 
 // statePutMinInterval is the minimum spacing between connect-state PUTs.
@@ -396,6 +408,7 @@ func (p *AppPlayer) buildStateRequest(reason connectpb.PutStateReason) *connectp
 // applyStatePushResult folds the outcome of a push back into the state. Runs on
 // the Run goroutine.
 func (p *AppPlayer) applyStatePushResult(res statePushResult) {
+	p.setCluster(res.cluster)
 	if res.publicIp != "" {
 		p.state.device.PublicIp = res.publicIp
 	}
