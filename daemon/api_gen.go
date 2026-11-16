@@ -13,6 +13,24 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for ConnectCommandEndpoint.
+const (
+	ConnectCommandEndpointPause     ConnectCommandEndpoint = "pause"
+	ConnectCommandEndpointPlay      ConnectCommandEndpoint = "play"
+	ConnectCommandEndpointResume    ConnectCommandEndpoint = "resume"
+	ConnectCommandEndpointSeekTo    ConnectCommandEndpoint = "seek_to"
+	ConnectCommandEndpointSetVolume ConnectCommandEndpoint = "set_volume"
+	ConnectCommandEndpointSkipNext  ConnectCommandEndpoint = "skip_next"
+	ConnectCommandEndpointSkipPrev  ConnectCommandEndpoint = "skip_prev"
+)
+
+// Defines values for QueueEntryProvider.
+const (
+	QueueEntryProviderAutoplay QueueEntryProvider = "autoplay"
+	QueueEntryProviderContext  QueueEntryProvider = "context"
+	QueueEntryProviderQueue    QueueEntryProvider = "queue"
+)
+
 // Defines values for TrackCodec.
 const (
 	TrackCodecAac     TrackCodec = "aac"
@@ -27,6 +45,81 @@ const (
 type ApiAddToQueue struct {
 	// Uri The URI for the track that should be added
 	Uri string `json:"uri"`
+}
+
+// ApiConnectCommand A command for another device of the cluster
+type ApiConnectCommand struct {
+	DeviceId string                 `json:"device_id"`
+	Endpoint ConnectCommandEndpoint `json:"endpoint"`
+
+	// Paused For `play`, load the context but keep it paused
+	Paused bool `json:"paused,omitempty"`
+
+	// Position For `seek_to`, the position in milliseconds
+	Position int64 `json:"position,omitempty"`
+
+	// SkipToUri For `play`, the URI of the track of the context to start at
+	SkipToUri string `json:"skip_to_uri,omitempty"`
+
+	// Uri For `play`, the context URI to play
+	Uri string `json:"uri,omitempty"`
+
+	// Volume For `set_volume`, from 0 to 65535
+	Volume int32 `json:"volume,omitempty"`
+}
+
+// ConnectCommandEndpoint defines model for ConnectCommand.Endpoint.
+type ConnectCommandEndpoint string
+
+// ApiConnectDevice A device of the account's Spotify Connect cluster
+type ApiConnectDevice struct {
+	// CanTransfer Whether the device lists no reason to disallow a transfer
+	CanTransfer bool   `json:"can_transfer"`
+	Id          string `json:"id"`
+	IsActive    bool   `json:"is_active"`
+	IsOffline   bool   `json:"is_offline"`
+
+	// IsSelf Whether this is the daemon's own device
+	IsSelf bool   `json:"is_self"`
+	Name   string `json:"name"`
+
+	// Type Lowercase device type, e.g. `computer`, `smartphone`, `speaker`
+	Type string `json:"type"`
+
+	// Volume Volume from 0 to 65535
+	Volume int32 `json:"volume"`
+}
+
+// ApiConnectDevices The latest Spotify Connect cluster known to the daemon
+type ApiConnectDevices struct {
+	ActiveDeviceId string             `json:"active_device_id"`
+	Devices        []ApiConnectDevice `json:"devices"`
+
+	// ApiConnectNowPlaying The cluster's player state, as reported by the active device
+	ApiConnectNowPlaying *ApiConnectNowPlaying `json:"now_playing,omitempty"`
+}
+
+// ApiConnectNowPlaying The cluster's player state, as reported by the active device
+type ApiConnectNowPlaying struct {
+	AlbumName  string `json:"album_name"`
+	ArtistName string `json:"artist_name"`
+	ContextUri string `json:"context_uri"`
+	Duration   int64  `json:"duration"`
+	Paused     bool   `json:"paused"`
+	Playing    bool   `json:"playing"`
+
+	// Position Position in milliseconds, extrapolated to the time of the response
+	Position  int64  `json:"position"`
+	TrackName string `json:"track_name"`
+	TrackUri  string `json:"track_uri"`
+}
+
+// ApiConnectTransfer A transfer of playback to another device
+type ApiConnectTransfer struct {
+	DeviceId string `json:"device_id"`
+
+	// Paused Keep the playback paused on the target instead of resuming it
+	Paused bool `json:"paused,omitempty"`
 }
 
 // ApiContextTrackItem One entry of a context listing
@@ -248,6 +341,42 @@ type ApiPlaylistRemoveTrack struct {
 	// Uri URI of the track or episode to remove
 	Uri string `json:"uri"`
 }
+
+// ApiPrev A skip to previous payload
+type ApiPrev struct {
+	// AllowSeeking Whether to rewind a track played past three seconds instead of skipping to the previous one
+	AllowSeeking *bool `json:"allow_seeking,omitempty"`
+}
+
+// ApiQueue The play order around the current track
+type ApiQueue struct {
+	// NextTracks Entries after the current one, nearest first, the user's queue before the rest, up to 32
+	NextTracks []ApiQueueEntry `json:"next_tracks"`
+
+	// PrevTracks Entries before the current one in the play order, farthest first, up to 32. Not a play history: a context started from one of its tracks lists the tracks before it
+	PrevTracks []ApiQueueEntry `json:"prev_tracks"`
+
+	// Track The current entry, null when nothing is loaded
+	Track *ApiQueueEntry `json:"track"`
+}
+
+// ApiQueueEntry One entry of the play order
+type ApiQueueEntry struct {
+	// Provider Where the entry comes from: the user's queue, the context, or autoplay once the context has ended
+	Provider QueueEntryProvider `json:"provider"`
+
+	// Track Track metadata (metadata.enabled), null until cached or for entries without any, such as local files. Its position is the playback position for the current entry and 0 for the others
+	Track *ApiTrack `json:"track"`
+
+	// Uid The entry's uid in the play order, which tells two copies of a track apart; null when it has none, as for album tracks
+	Uid *string `json:"uid"`
+
+	// Uri The entry URI, usually a track or an episode
+	Uri string `json:"uri"`
+}
+
+// QueueEntryProvider Where the entry comes from: the user's queue, the context, or autoplay once the context has ended
+type QueueEntryProvider string
 
 // ApiRepeatContext A toggle repeating context payload
 type ApiRepeatContext struct {
@@ -487,6 +616,12 @@ type PlaylistContainsParams struct {
 	Uris []string `form:"uris" json:"uris"`
 }
 
+// ConnectCommandJSONRequestBody defines body for ConnectCommand for application/json ContentType.
+type ConnectCommandJSONRequestBody = ApiConnectCommand
+
+// ConnectTransferJSONRequestBody defines body for ConnectTransfer for application/json ContentType.
+type ConnectTransferJSONRequestBody = ApiConnectTransfer
+
 // SetLikedJSONRequestBody defines body for SetLiked for application/json ContentType.
 type SetLikedJSONRequestBody = ApiSetLiked
 
@@ -507,6 +642,9 @@ type PlayerOutputJSONRequestBody = ApiOutput
 
 // PlayerPlayJSONRequestBody defines body for PlayerPlay for application/json ContentType.
 type PlayerPlayJSONRequestBody = ApiPlay
+
+// PlayerPrevJSONRequestBody defines body for PlayerPrev for application/json ContentType.
+type PlayerPrevJSONRequestBody = ApiPrev
 
 // PlayerRepeatContextJSONRequestBody defines body for PlayerRepeatContext for application/json ContentType.
 type PlayerRepeatContextJSONRequestBody = ApiRepeatContext
@@ -534,6 +672,15 @@ type ServerInterface interface {
 
 	// (GET /auth/code)
 	GetAuthCode(w http.ResponseWriter, r *http.Request)
+
+	// (POST /connect/command)
+	ConnectCommand(w http.ResponseWriter, r *http.Request)
+
+	// (GET /connect/devices)
+	GetConnectDevices(w http.ResponseWriter, r *http.Request)
+
+	// (POST /connect/transfer)
+	ConnectTransfer(w http.ResponseWriter, r *http.Request)
 
 	// (GET /context/tracks)
 	GetContextTracks(w http.ResponseWriter, r *http.Request, params GetContextTracksParams)
@@ -585,6 +732,9 @@ type ServerInterface interface {
 
 	// (POST /player/prev)
 	PlayerPrev(w http.ResponseWriter, r *http.Request)
+
+	// (GET /player/queue)
+	PlayerGetQueue(w http.ResponseWriter, r *http.Request)
 
 	// (POST /player/repeat_context)
 	PlayerRepeatContext(w http.ResponseWriter, r *http.Request)
@@ -648,6 +798,48 @@ func (siw *ServerInterfaceWrapper) GetAuthCode(w http.ResponseWriter, r *http.Re
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetAuthCode(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ConnectCommand operation middleware
+func (siw *ServerInterfaceWrapper) ConnectCommand(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ConnectCommand(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetConnectDevices operation middleware
+func (siw *ServerInterfaceWrapper) GetConnectDevices(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetConnectDevices(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ConnectTransfer operation middleware
+func (siw *ServerInterfaceWrapper) ConnectTransfer(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ConnectTransfer(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1033,6 +1225,20 @@ func (siw *ServerInterfaceWrapper) PlayerPrev(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// PlayerGetQueue operation middleware
+func (siw *ServerInterfaceWrapper) PlayerGetQueue(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PlayerGetQueue(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // PlayerRepeatContext operation middleware
 func (siw *ServerInterfaceWrapper) PlayerRepeatContext(w http.ResponseWriter, r *http.Request) {
 
@@ -1309,6 +1515,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 
 	m.HandleFunc("GET "+options.BaseURL+"/{$}", wrapper.GetRoot)
 	m.HandleFunc("GET "+options.BaseURL+"/auth/code", wrapper.GetAuthCode)
+	m.HandleFunc("POST "+options.BaseURL+"/connect/command", wrapper.ConnectCommand)
+	m.HandleFunc("GET "+options.BaseURL+"/connect/devices", wrapper.GetConnectDevices)
+	m.HandleFunc("POST "+options.BaseURL+"/connect/transfer", wrapper.ConnectTransfer)
 	m.HandleFunc("GET "+options.BaseURL+"/context/tracks", wrapper.GetContextTracks)
 	m.HandleFunc("GET "+options.BaseURL+"/events", wrapper.GetEvents)
 	m.HandleFunc("GET "+options.BaseURL+"/library/albums", wrapper.GetLibraryAlbums)
@@ -1326,6 +1535,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc("POST "+options.BaseURL+"/player/play", wrapper.PlayerPlay)
 	m.HandleFunc("POST "+options.BaseURL+"/player/playpause", wrapper.PlayerPlayPause)
 	m.HandleFunc("POST "+options.BaseURL+"/player/prev", wrapper.PlayerPrev)
+	m.HandleFunc("GET "+options.BaseURL+"/player/queue", wrapper.PlayerGetQueue)
 	m.HandleFunc("POST "+options.BaseURL+"/player/repeat_context", wrapper.PlayerRepeatContext)
 	m.HandleFunc("POST "+options.BaseURL+"/player/repeat_track", wrapper.PlayerRepeatTrack)
 	m.HandleFunc("POST "+options.BaseURL+"/player/resume", wrapper.PlayerResume)

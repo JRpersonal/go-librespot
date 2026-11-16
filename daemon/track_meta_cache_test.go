@@ -104,9 +104,13 @@ func recordingFetch(fetch fetchFunc) (fetchFunc, func() [][]string) {
 func newMetaTestPlayer(t *testing.T, fetch fetchFunc, resolve func(context.Context, string) (tracks.ContextResolver, error)) *AppPlayer {
 	t.Helper()
 
+	server, err := NewStubApiServer(&librespot.NullLogger{})
+	require.NoError(t, err)
+
 	app := &App{
 		log:          &librespot.NullLogger{},
 		cfg:          &Config{Metadata: MetadataConfig{Enabled: true}},
+		server:       &recordingApiServer{ApiServer: server},
 		metaCache:    newTrackMetaCache(trackMetaCacheLimit),
 		contextLists: newContextListCache(),
 	}
@@ -381,8 +385,8 @@ func TestMetadataDisabledIsNoop(t *testing.T) {
 	require.False(t, claimed(cl, "spotify:playlist:a"), "a nil cache never claims an enumeration")
 
 	// A disabled player: no timer is armed and no session is touched.
-	p := &AppPlayer{app: &App{cfg: &Config{}}, state: &State{}}
-	p.state.reset()
+	p := newTestAppPlayer(t)
+	p.app.cfg = &Config{}
 	p.publishSnapshot(&tracks.Snapshot{Current: provided(trackUri(0x01)), Next: []*connectpb.ProvidedTrack{provided(trackUri(0x02))}})
 	p.scheduleContextEnumerate("spotify:playlist:a")
 	p.scheduleMetaSweep([]string{"spotify:track:a"}, "test")
@@ -399,6 +403,20 @@ func TestContextSweepRequiresItsOwnOptIn(t *testing.T) {
 
 	p.scheduleContextMetaPrefetch("spotify:playlist:a")
 	require.Empty(t, p.lastFullMetaContext, "no context sweep without metadata.context_sweep")
+}
+
+// A list of items played with no context of its own, as the Web API plays
+// "uris", is not swept: its uri names no context to enumerate.
+func TestContextSweepSkipsBareTrackLists(t *testing.T) {
+	p := newMetaTestPlayer(t, echoMetadata, func(context.Context, string) (tracks.ContextResolver, error) {
+		return nil, errors.New("not a context")
+	})
+	p.app.cfg.Metadata.ContextSweep = true
+
+	for _, uri := range []string{"", librespot.WebApiTrackListUri} {
+		p.scheduleContextMetaPrefetch(uri)
+		require.Empty(t, p.lastFullMetaContext, "no context sweep for %q", uri)
+	}
 }
 
 func TestMetaMaxTracksDefault(t *testing.T) {
@@ -566,6 +584,69 @@ func TestEnumerateContextTracksReportsPageErrors(t *testing.T) {
 
 	_, err := enumerateContextTracks(t.Context(), resolver, defaultMetaMaxTracks)
 	require.ErrorIs(t, err, boom)
+}
+
+// So is a later page of any context but a station: a transient failure on a
+// long playlist is retried rather than cached as a short listing.
+func TestEnumerateContextTracksReportsLaterPageErrors(t *testing.T) {
+	boom := errors.New("boom")
+
+	resolver := tracks.NewMockContextResolver(t)
+	resolver.EXPECT().Type().Return(librespot.SpotifyIdTypeTrack)
+	resolver.EXPECT().Uri().Return("spotify:playlist:0hgSZmY9xhzx51hlLB2arI")
+	resolver.EXPECT().Page(mock.Anything, 0).Return([]*connectpb.ContextTrack{contextTrack(trackUri(0x01), nil)}, nil)
+	resolver.EXPECT().Page(mock.Anything, 1).Return(nil, boom)
+
+	_, err := enumerateContextTracks(t.Context(), resolver, defaultMetaMaxTracks)
+	require.ErrorIs(t, err, boom)
+}
+
+// A station is endless and its radio-router may answer 404 for a later page.
+// Once the station yielded tracks, a failure ends the listing with what was
+// fetched, or the station would never list.
+func TestEnumerateContextTracksKeepsStationPagesBeforeAFailure(t *testing.T) {
+	resolver := tracks.NewMockContextResolver(t)
+	resolver.EXPECT().Type().Return(librespot.SpotifyIdTypeTrack)
+	resolver.EXPECT().Uri().Return("spotify:station:track:4cOdK2wGLETKBW3PvgPWqT")
+	resolver.EXPECT().Page(mock.Anything, 0).Return([]*connectpb.ContextTrack{contextTrack(trackUri(0x01), nil), contextTrack(trackUri(0x02), nil)}, nil)
+	resolver.EXPECT().Page(mock.Anything, 1).Return(nil, errors.New("invalid status code from page: 404"))
+
+	uris, err := enumerateContextTracks(t.Context(), resolver, defaultMetaMaxTracks)
+	require.NoError(t, err)
+	require.Equal(t, []string{trackUri(0x01), trackUri(0x02)}, uris)
+}
+
+// A station with no tracks before the failure has nothing to list: that stays
+// an error rather than an empty listing cached as ready.
+func TestEnumerateContextTracksReportsStationErrorsBeforeAnyTrack(t *testing.T) {
+	boom := errors.New("boom")
+
+	resolver := tracks.NewMockContextResolver(t)
+	resolver.EXPECT().Type().Return(librespot.SpotifyIdTypeTrack)
+	resolver.EXPECT().Uri().Return("spotify:station:track:4cOdK2wGLETKBW3PvgPWqT").Maybe()
+	resolver.EXPECT().Page(mock.Anything, 0).Return(nil, nil)
+	resolver.EXPECT().Page(mock.Anything, 1).Return(nil, boom)
+
+	_, err := enumerateContextTracks(t.Context(), resolver, defaultMetaMaxTracks)
+	require.ErrorIs(t, err, boom)
+}
+
+// A cancelled enumeration of a station is not a short listing: it stays an
+// error, so the partial listing is not cached as the whole one.
+func TestEnumerateContextTracksReportsStationCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+
+	resolver := tracks.NewMockContextResolver(t)
+	resolver.EXPECT().Type().Return(librespot.SpotifyIdTypeTrack)
+	resolver.EXPECT().Uri().Return("spotify:station:track:4cOdK2wGLETKBW3PvgPWqT")
+	resolver.EXPECT().Page(mock.Anything, 0).Return([]*connectpb.ContextTrack{contextTrack(trackUri(0x01), nil)}, nil)
+	resolver.EXPECT().Page(mock.Anything, 1).RunAndReturn(func(ctx context.Context, _ int) ([]*connectpb.ContextTrack, error) {
+		cancel()
+		return nil, ctx.Err()
+	})
+
+	_, err := enumerateContextTracks(ctx, resolver, defaultMetaMaxTracks)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 // A generated context hands out pages forever; the enumeration gives up where
@@ -753,6 +834,37 @@ func TestContextTracksHandler(t *testing.T) {
 
 	require.Len(t, calls(), 1, "one sweep, one batch")
 	require.Equal(t, 1, resolved)
+}
+
+// A station lists the page it got even though the radio-router fails the next
+// one, instead of staying not-ready forever.
+func TestContextTracksHandlerListsStationFirstPage(t *testing.T) {
+	const station = "spotify:station:track:4cOdK2wGLETKBW3PvgPWqT"
+	want := []string{trackUri(0x01), trackUri(0x02)}
+
+	resolver := tracks.NewMockContextResolver(t)
+	resolver.EXPECT().Type().Return(librespot.SpotifyIdTypeTrack)
+	resolver.EXPECT().Page(mock.Anything, 0).Return([]*connectpb.ContextTrack{contextTrack(want[0], nil), contextTrack(want[1], nil)}, nil)
+	resolver.EXPECT().Uri().Return(station)
+	resolver.EXPECT().Page(mock.Anything, 1).Return(nil, errors.New("invalid status code from page: 404"))
+
+	fetch, _ := recordingFetch(echoMetadata)
+	p := newMetaTestPlayer(t, fetch, func(context.Context, string) (tracks.ContextResolver, error) {
+		return resolver, nil
+	})
+
+	var resp *ApiContextTracks
+	require.Eventually(t, func() bool {
+		data, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeContextTracks, Data: ApiRequestDataContextTracks{Uri: station}})
+		require.NoError(t, err)
+		resp = data.(*ApiContextTracks)
+		return resp.Ready && resp.Cached == resp.Length
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.Equal(t, len(want), resp.Length)
+	for i, entry := range resp.Tracks {
+		require.Equal(t, want[i], entry.Uri)
+	}
 }
 
 // The status response names the upcoming track only once its metadata is

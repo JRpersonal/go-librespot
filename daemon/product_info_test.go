@@ -25,7 +25,7 @@ func TestProductTypeUnknownIsNil(t *testing.T) {
 }
 
 func TestProductTypeFromAccesspointPacket(t *testing.T) {
-	p := &AppPlayer{}
+	p := newTestAppPlayer(t)
 	require.Nil(t, productType(p.prodInfo))
 
 	payload := []byte(`<products><product><type>Premium</type>` +

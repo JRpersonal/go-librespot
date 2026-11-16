@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"time"
 
+	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/events"
 	"github.com/devgianlu/go-librespot/mercury"
 	"github.com/devgianlu/go-librespot/player"
@@ -60,7 +60,7 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	}
 
 	if s.client == nil {
-		s.client = &http.Client{Timeout: 30 * time.Second}
+		s.client = librespot.NewHttpClient()
 	}
 
 	// use provided client token or retrieve a new one
@@ -80,7 +80,7 @@ func NewSessionFromOptions(ctx context.Context, opts *Options) (*Session, error)
 	if opts.Resolver != nil {
 		s.resolver = opts.Resolver
 	} else {
-		s.resolver = apresolve.NewApResolver(opts.Log, s.client, opts.PreferFirewallFriendlyPorts)
+		s.resolver = apresolve.NewApResolver(opts.Log, s.client, apresolve.AccesspointPorts(opts.AccesspointPorts, opts.PreferFirewallFriendlyPorts))
 	}
 
 	// create new login5.Login5

@@ -131,6 +131,7 @@ func (p *AppPlayer) commitPrefetch(stream *player.Stream, source librespot.Audio
 	p.secondarySource = source
 	p.player.SetSecondaryStream(source)
 	p.app.metaCache.putStream(stream.RequestedId.Uri(), stream.Media)
+	p.emitQueue()
 
 	p.app.log.WithField("uri", stream.RequestedId.Uri()).
 		Infof("prefetched %s %s (duration: %dms)", stream.RequestedId.Type(),
@@ -392,7 +393,7 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
 	// track is not known until the context resolves. The stream that was
 	// playing carries on until then and may still raise events, so nothing on
 	// the loop may assume Track is set.
-	p.state.player.Track = nil
+	p.state.clearTrack()
 	p.state.player.PrevTracks = nil
 	p.state.player.NextTracks = nil
 	p.state.player.Index = nil
@@ -404,6 +405,7 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
 	p.state.player.IsBuffering = true
 	p.state.player.PlaybackSpeed = 0
 	p.updateState()
+	p.emitQueue()
 
 	shuffle := p.state.player.Options.ShufflingContext
 	p.loadGen++
@@ -694,7 +696,7 @@ func (p *AppPlayer) abandonTransfer() {
 	p.state.player.ContextUrl = ""
 	p.state.player.ContextMetadata = nil
 	p.state.player.ContextRestrictions = nil
-	p.state.player.Track = nil
+	p.state.clearTrack()
 	p.state.player.PrevTracks = nil
 	p.state.player.NextTracks = nil
 	p.state.player.Index = nil
@@ -706,6 +708,7 @@ func (p *AppPlayer) abandonTransfer() {
 	p.state.player.PositionAsOfTimestamp = 0
 
 	p.flushState()
+	p.emitQueue()
 }
 
 // playingQueuedTrack reports whether a transfer hands over a queued track as
@@ -1092,6 +1095,7 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
 	// Track wholesale with a fresh ProvidedTrack from the track list.
 	enrichTrackMetadata(p.state.player.Track, stream.Media)
 	p.app.metaCache.putStream(uri, stream.Media)
+	p.emitQueue()
 
 	p.state.player.Timestamp = time.Now().UnixMilli()
 	p.state.player.PositionAsOfTimestamp = trackPosition
@@ -1817,6 +1821,7 @@ func (p *AppPlayer) stopPlayback() {
 
 	p.state.reset()
 	p.pushState(connectpb.PutStateReason_BECAME_INACTIVE)
+	p.emitQueue()
 
 	p.schedulePrefetchNext()
 

@@ -268,6 +268,9 @@ type metaFetcher struct {
 	fetch   func(ctx context.Context, req *extmetadatapb.BatchedEntityRequest) (*extmetadatapb.BatchedExtensionResponse, error)
 	resolve func(ctx context.Context, uri string) (tracks.ContextResolver, error)
 
+	// cached is signalled each time a batch cached tracks.
+	cached chan struct{}
+
 	// inFlight single-flights the window fetch: a timer that fires while one
 	// runs re-arms itself rather than starting another.
 	inFlight atomic.Bool
@@ -277,9 +280,10 @@ type metaFetcher struct {
 
 func newMetaFetcher(log librespot.Logger, cache *trackMetaCache, sp *spclient.Spclient) *metaFetcher {
 	return &metaFetcher{
-		log:   log,
-		cache: cache,
-		fetch: sp.ExtendedMetadata,
+		log:    log,
+		cache:  cache,
+		cached: make(chan struct{}, 1),
+		fetch:  sp.ExtendedMetadata,
 		resolve: func(ctx context.Context, uri string) (tracks.ContextResolver, error) {
 			// A context of its own, never the playing one: the resolver behind
 			// a track list mutates its pages as it walks, and is reachable only
@@ -346,6 +350,12 @@ func (f *metaFetcher) fetchBatch(ctx context.Context, uris []string) (int, error
 		}
 	}
 
+	if cached > 0 {
+		select {
+		case f.cached <- struct{}{}:
+		default: // one already pending says the same
+		}
+	}
 	return cached, nil
 }
 
@@ -385,7 +395,10 @@ func (f *metaFetcher) sweep(ctx context.Context, missing []string, label string)
 // enumerateContextTracks walks every page of a context in its own order and
 // returns the track and episode uris it holds, at most maxTracks of them. It
 // stops at the end of the context, at the page cap, or on the first page that
-// fails to load.
+// fails to load, which is an error. A station that already yielded tracks is
+// the exception: it is endless, and the radio-router may answer 404 for a
+// later page, so a failure there ends the listing with the pages before it
+// instead of leaving the station unlisted forever.
 func enumerateContextTracks(ctx context.Context, resolver tracks.ContextResolver, maxTracks int) ([]string, error) {
 	typ := resolver.Type()
 
@@ -393,6 +406,8 @@ func enumerateContextTracks(ctx context.Context, resolver tracks.ContextResolver
 	for page := 0; page < maxContextPages; page++ {
 		items, err := resolver.Page(ctx, page)
 		if errors.Is(err, io.EOF) {
+			return uris, nil
+		} else if err != nil && len(uris) > 0 && strings.HasPrefix(resolver.Uri(), "spotify:station:") && ctx.Err() == nil {
 			return uris, nil
 		} else if err != nil {
 			return nil, fmt.Errorf("failed fetching page %d: %w", page, err)
@@ -538,11 +553,15 @@ func (p *AppPlayer) prefetchWindowMetadata() {
 // started playing, so every track in it is known to /status (next_track) before
 // the user skips anywhere. Opt-in via metadata.context_sweep; skipped when this
 // context was already swept. Runs on the Run goroutine.
+//
+// A list of items played with no context of its own, as the Web API plays
+// "uris" (with no uri or with WebApiTrackListUri), has nothing to enumerate:
+// its uri names no context that could be resolved.
 func (p *AppPlayer) scheduleContextMetaPrefetch(contextUri string) {
 	if p.meta == nil || !p.app.cfg.Metadata.ContextSweep {
 		return
 	}
-	if contextUri == "" || contextUri == p.lastFullMetaContext {
+	if contextUri == "" || contextUri == librespot.WebApiTrackListUri || contextUri == p.lastFullMetaContext {
 		return
 	}
 
@@ -686,6 +705,12 @@ func (p *AppPlayer) contextTracksResponse(contextUri string, uris []string, read
 			resp.Cached++
 		}
 		resp.Tracks = append(resp.Tracks, entry)
+	}
+
+	// Keep the window the most recently used part of the cache, ahead of the
+	// tracks just listed.
+	for _, uri := range p.windowMetaUris() {
+		p.meta.cache.get(uri)
 	}
 	return resp
 }
